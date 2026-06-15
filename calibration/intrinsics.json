@@ -1,0 +1,16 @@
+{
+  "_note": "PLACEHOLDER — run `python calibration/calibrate.py` on your own checkerboard images to overwrite this file.",
+  "fx": 1500.0,
+  "fy": 1500.0,
+  "cx": 960.0,
+  "cy": 540.0,
+  "width": 1920,
+  "height": 1080,
+  "camera_matrix": [
+    [1500.0, 0.0, 960.0],
+    [0.0, 1500.0, 540.0],
+    [0.0, 0.0, 1.0]
+  ],
+  "dist_coeffs": [0.0, 0.0, 0.0, 0.0, 0.0],
+  "reprojection_error_px": null
+}

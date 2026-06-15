@@ -1,0 +1,48 @@
+# -----------------------------------------------------------------------
+# default.yaml — single source of truth for all tunable values.
+# All thresholds in the pipeline are read from here; never hard-code them.
+# -----------------------------------------------------------------------
+
+paths:
+  cache_dir: data/cache           # Stage A writes here; Stage B reads here
+  output_dir: output              # annotated video output
+  intrinsics: calibration/intrinsics.json
+
+camera:
+  intrinsics: calibration/intrinsics.json
+
+# RANSAC ground-plane fitting (src/geometry/ground_plane.py)
+# Iteration count formula: N = ceil(log(1-p) / log(1-(1-e)^s))
+#   p=0.99 (desired success probability), e=0.5 (outlier fraction), s=3 (sample size)
+ground_plane:
+  ransac_distance_threshold: 0.05   # meters — inlier distance to fitted plane
+  ransac_max_iterations: 1000
+  ransac_min_inliers: 100           # minimum inliers to accept a hypothesis
+
+# Obstacle detection (src/obstacles/detector.py)
+obstacles:
+  height_threshold: 0.15            # meters above ground plane → obstacle candidate
+  dbscan_eps: 0.5                   # neighborhood radius in meters
+  dbscan_min_samples: 10            # DBSCAN core-point density requirement
+  min_cluster_size: 15              # discard clusters smaller than this (noise)
+
+# Sidewalk corridor (src/segmentation/boundary.py)
+corridor:
+  boundary_poly_degree: 2           # polynomial degree for left/right boundary fit
+  corridor_margin: 20               # pixel margin inset from the raw mask edge
+
+# Temporal tracking (src/obstacles/tracker.py)
+tracking:
+  ema_alpha: 0.4                    # EMA weight for new observation (0=ignore, 1=replace)
+  max_lost_frames: 10               # frames before a lost track is pruned
+  max_match_distance_m: 2.0         # max 3D centroid distance to associate to a track
+
+# Stage A — Depth Anything V2 metric (src/depth/depth_estimator.py)
+depth:
+  model_name: "depth-anything/Depth-Anything-V2-Metric-Outdoor-Small-hf"
+  input_resolution: [518, 518]      # model's expected input (H, W)
+
+# Stage A — SegFormer (src/segmentation/sidewalk_seg.py)
+segmentation:
+  model_name: "nvidia/segformer-b2-finetuned-cityscapes-1024-1024"
+  sidewalk_class_id: 1              # Cityscapes: 0=road, 1=sidewalk, 2=building …

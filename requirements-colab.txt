@@ -1,0 +1,11 @@
+# Stage A (GPU / Google Colab) — install this on Colab before running
+# scripts/run_inference_colab.py or notebooks/inference.ipynb.
+# Do NOT install this on the local CPU-only machine.
+torch>=2.1
+torchvision>=0.16
+transformers>=4.40
+accelerate>=0.27
+Pillow>=10.0
+numpy>=1.24
+opencv-python>=4.8
+pyyaml>=6.0
