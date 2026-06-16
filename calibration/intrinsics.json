@@ -1,16 +1,62 @@
 {
-  "_note": "PLACEHOLDER — run `python calibration/calibrate.py` on your own checkerboard images to overwrite this file.",
-  "fx": 1500.0,
-  "fy": 1500.0,
-  "cx": 960.0,
-  "cy": 540.0,
+  "fx": 1568.0626849706705,
+  "fy": 1565.9471131588807,
+  "cx": 967.7851040061314,
+  "cy": 539.3221029171751,
   "width": 1920,
   "height": 1080,
   "camera_matrix": [
-    [1500.0, 0.0, 960.0],
-    [0.0, 1500.0, 540.0],
-    [0.0, 0.0, 1.0]
+    [
+      1568.0626849706705,
+      0.0,
+      967.7851040061314
+    ],
+    [
+      0.0,
+      1565.9471131588807,
+      539.3221029171751
+    ],
+    [
+      0.0,
+      0.0,
+      1.0
+    ]
   ],
-  "dist_coeffs": [0.0, 0.0, 0.0, 0.0, 0.0],
-  "reprojection_error_px": null
+  "dist_coeffs": [
+    0.21906683378113517,
+    -1.1972148821395852,
+    -0.000800866865366497,
+    -0.0010371287377245104,
+    1.783528243762574
+  ],
+  "reprojection_error_px": 0.8832904596716075,
+  "per_image_error_px": {
+    "calib_000.png": 0.4228,
+    "calib_001.png": 1.1171,
+    "calib_002.png": 1.0174,
+    "calib_003.png": 0.7448,
+    "calib_005.png": 0.7591,
+    "calib_006.png": 0.5196,
+    "calib_008.png": 0.9774,
+    "calib_009.png": 0.4394,
+    "calib_010.png": 0.4031,
+    "calib_011.png": 1.2285,
+    "calib_012.png": 1.1242,
+    "calib_013.png": 0.6541,
+    "calib_014.png": 0.8313,
+    "calib_015.png": 1.2512,
+    "calib_016.png": 0.7743,
+    "calib_017.png": 0.7414,
+    "calib_019.png": 0.8963,
+    "calib_020.png": 0.759,
+    "calib_021.png": 0.6846,
+    "calib_022.png": 0.6903,
+    "calib_023.png": 0.6551,
+    "calib_024.png": 0.9343,
+    "calib_025.png": 0.7703,
+    "calib_026.png": 0.8452,
+    "calib_027.png": 1.2071,
+    "calib_028.png": 1.23,
+    "calib_029.png": 1.1752
+  }
 }
