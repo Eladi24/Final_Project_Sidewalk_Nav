@@ -216,7 +216,8 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
-
+# the claude.md file
+Claude.md
 # Project data — videos, images, calibration captures, caches (none of this in git)
 /data/
 
