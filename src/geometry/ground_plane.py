@@ -62,8 +62,9 @@ def _fit_plane_3pts(p1: np.ndarray, p2: np.ndarray, p3: np.ndarray) -> np.ndarra
 def fit_ground_plane(
     points: np.ndarray,
     distance_threshold: float = 0.05,
-    max_iterations: int = 1000,
+    max_iterations: int = 200,
     min_inliers: int = 100,
+    max_input_points: int = 15000,
     rng: np.random.Generator | None = None,
 ) -> tuple[np.ndarray | None, np.ndarray]:
     """Fit a ground plane to a 3-D point cloud using RANSAC.
@@ -74,14 +75,21 @@ def fit_ground_plane(
     Args:
         points: float32/float64 array of shape (N, 3) — 3-D points in metres.
         distance_threshold: inlier distance to plane in metres (tau).
-        max_iterations: number of RANSAC iterations (N in the formula above).
+        max_iterations: number of RANSAC iterations.  With 50 % inlier rate
+            and s=3, only 35 iterations are theoretically needed for p=0.99
+            success probability.  200 gives a large safety margin.
         min_inliers: minimum inlier count to accept a hypothesis at all.
+        max_input_points: subsample the input to at most this many points
+            before running RANSAC.  A flat plane can be reliably recovered
+            from a few thousand well-distributed points; running on 200k+
+            points just slows down each iteration with no quality gain.
+            The final SVD refit always uses ALL original inliers.
         rng: optional numpy random Generator for reproducibility.
 
     Returns:
         plane: float64 array (4,) = [a, b, c, d] with ||(a,b,c)|| = 1,
                or ``None`` if no plane with enough inliers was found.
-        inlier_mask: bool array (N,), True for inlier points.
+        inlier_mask: bool array (N,) over the ORIGINAL points, True for inliers.
     """
     if rng is None:
         rng = np.random.default_rng()
@@ -90,35 +98,34 @@ def fit_ground_plane(
     if N < 3:
         return None, np.zeros(N, dtype=bool)
 
+    # Subsample for the RANSAC search — keeps each iteration fast.
+    # The final least-squares SVD refit below uses all original inliers.
+    if N > max_input_points:
+        sample_idx = rng.choice(N, size=max_input_points, replace=False)
+        pts_ransac = points[sample_idx]
+    else:
+        sample_idx = None
+        pts_ransac = points
+
     best_plane: np.ndarray | None = None
     best_inlier_count = 0
     best_inlier_mask = np.zeros(N, dtype=bool)
 
-    # Preallocate scratch buffers ONCE and reuse them in-place for every
-    # iteration below, instead of allocating fresh `dists`/`inlier_mask`
-    # arrays on each of up to `max_iterations` passes. With large point
-    # clouds (hundreds of thousands of points) and max_iterations=1000,
-    # the naive version allocates/frees gigabytes of short-lived arrays per
-    # call — harmless on its own, but across hundreds of video frames this
-    # rapid alloc/free churn fragments the memory allocator and can drive
-    # RSS up until the OS kills the process. Reusing buffers makes this loop
-    # allocate nothing after setup, regardless of max_iterations.
-    x, y, z = points[:, 0], points[:, 1], points[:, 2]
-    dists = np.empty(N, dtype=np.float64)
-    tmp = np.empty(N, dtype=np.float64)
-    inlier_mask = np.empty(N, dtype=bool)
+    M = len(pts_ransac)
+    x, y, z = pts_ransac[:, 0], pts_ransac[:, 1], pts_ransac[:, 2]
+    dists = np.empty(M, dtype=np.float64)
+    tmp   = np.empty(M, dtype=np.float64)
+    inlier_mask_s = np.empty(M, dtype=bool)
 
     for _ in range(max_iterations):
-        idx = rng.choice(N, size=3, replace=False)
-        p1, p2, p3 = points[idx[0]], points[idx[1]], points[idx[2]]
+        idx = rng.choice(M, size=3, replace=False)
+        p1, p2, p3 = pts_ransac[idx[0]], pts_ransac[idx[1]], pts_ransac[idx[2]]
 
         plane = _fit_plane_3pts(p1, p2, p3)
         if plane is None:
             continue  # collinear sample, skip
 
         a, b, c, d = plane
-        # Signed distances (unit normal, so no division), computed in-place
-        # into the preallocated `dists`/`tmp` buffers — no new arrays.
         np.multiply(x, a, out=dists)
         np.multiply(y, b, out=tmp)
         dists += tmp
@@ -126,22 +133,24 @@ def fit_ground_plane(
         dists += tmp
         dists += d
         np.abs(dists, out=dists)
-        np.less(dists, distance_threshold, out=inlier_mask)
-        inlier_count = int(inlier_mask.sum())
+        np.less(dists, distance_threshold, out=inlier_mask_s)
+        inlier_count = int(inlier_mask_s.sum())
 
         if inlier_count > best_inlier_count:
             best_inlier_count = inlier_count
-            # inlier_mask is reused next iteration — must copy to keep this one
-            best_inlier_mask = inlier_mask.copy()
             best_plane = plane
 
     if best_plane is None or best_inlier_count < min_inliers:
         return None, best_inlier_mask
 
-    # Refit the plane to ALL inliers with least squares for a more stable result
+    # Refit using ALL original points (not just the subsample) for accuracy
+    a, b, c, d = best_plane
+    full_dists = np.abs(points[:, 0]*a + points[:, 1]*b + points[:, 2]*c + d)
+    best_inlier_mask = full_dists < distance_threshold
+
     inlier_pts = points[best_inlier_mask]
     centroid = inlier_pts.mean(axis=0)
-    _, _, Vt = np.linalg.svd(inlier_pts - centroid)
+    _, _, Vt = np.linalg.svd(inlier_pts - centroid, full_matrices=False)
     n = Vt[-1]  # eigenvector corresponding to smallest singular value
     n = n / np.linalg.norm(n)
     d = -float(np.dot(n, centroid))

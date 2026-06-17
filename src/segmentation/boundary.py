@@ -129,6 +129,7 @@ def corridor_mask(
     shape: tuple[int, int],
     boundary: SidewalkBoundary,
     margin: int = 20,
+    max_width_px: np.ndarray | None = None,
 ) -> np.ndarray:
     """Rasterize the walkable corridor into a full-resolution boolean mask.
 
@@ -136,14 +137,17 @@ def corridor_mask(
     frame instead of every pixel — sky, building facades, and anything far
     outside the corridor can never contain a sidewalk obstacle, so excluding
     them up front avoids back-projecting (and clustering) millions of
-    irrelevant pixels per frame. Equivalent in result to back-projecting
-    everything and calling :func:`points_in_corridor` afterward, just far
-    cheaper in memory and time.
+    irrelevant pixels per frame.
 
     Args:
         shape: (H, W) of the target frame.
         boundary: fitted SidewalkBoundary from :func:`extract_boundaries`.
-        margin: same safety inset used by :func:`points_in_corridor`.
+        margin: safety inset in pixels from the raw polynomial boundary.
+        max_width_px: optional 1-D array of shape (v_max-v_min+1,) giving the
+            maximum corridor width in pixels for each row.  When provided the
+            right boundary is clamped to ``left_u + max_width_px`` so the
+            corridor cannot bleed into the car road.  Compute from camera
+            intrinsics as ``max_width_m * fx / Z_row``.
 
     Returns:
         mask: bool array of shape (H, W), True inside the corridor band.
@@ -157,11 +161,16 @@ def corridor_mask(
         return mask
 
     rows = np.arange(v_min, v_max + 1)
-    left_u = np.polyval(boundary.left_poly, rows) + margin
+    left_u  = np.polyval(boundary.left_poly,  rows) + margin
     right_u = np.polyval(boundary.right_poly, rows) - margin
 
+    # Physical width cap: right boundary cannot exceed left + max allowed width.
+    # This prevents the corridor from spanning the car road when the traversable
+    # mask (class 0 + 1) is wider than the actual pedestrian path.
+    if max_width_px is not None:
+        right_u = np.minimum(right_u, left_u + max_width_px)
+
     u_grid = np.arange(W)
-    # Vectorised per-row band: True where left_u[row] <= u <= right_u[row]
     row_band = (u_grid[np.newaxis, :] >= left_u[:, np.newaxis]) & \
                (u_grid[np.newaxis, :] <= right_u[:, np.newaxis])
     mask[v_min:v_max + 1, :] = row_band

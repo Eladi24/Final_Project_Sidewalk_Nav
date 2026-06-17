@@ -16,8 +16,12 @@ camera:
 #   p=0.99 (desired success probability), e=0.5 (outlier fraction), s=3 (sample size)
 ground_plane:
   ransac_distance_threshold: 0.05   # meters — inlier distance to fitted plane
-  ransac_max_iterations: 1000
+  ransac_max_iterations: 200        # formula: log(1-p)/log(1-(1-e)^s)
+                                    # p=0.99, e=0.5 outlier rate, s=3 → only 35 iters needed
+                                    # 200 gives large safety margin with no quality loss
   ransac_min_inliers: 100           # minimum inliers to accept a hypothesis
+  ransac_max_input_points: 15000    # subsample before RANSAC — a flat plane needs only
+                                    # a few thousand well-distributed points to fit reliably
 
 # Obstacle detection (src/obstacles/detector.py)
 obstacles:
@@ -34,6 +38,14 @@ obstacles:
 corridor:
   boundary_poly_degree: 2           # polynomial degree for left/right boundary fit
   corridor_margin: 20               # pixel margin inset from the raw mask edge
+  boundary_ema_alpha: 0.4           # temporal EMA weight for new boundary observation.
+                                    # Lower = more smoothing / longer memory for gaps
+                                    # (parking entrances, missing curb sections).
+                                    # 0.4 ≈ 2.5-frame effective window at 30 fps.
+  max_corridor_width_m: 4.0         # hard physical cap on corridor width in metres.
+                                    # Prevents the right boundary from bleeding into
+                                    # the car road when class 0 (road) is in the mask.
+                                    # Standard Israeli sidewalk: 1.5 – 3 m; 4 m is safe.
 
 # Temporal tracking (src/obstacles/tracker.py)
 tracking:

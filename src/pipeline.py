@@ -23,7 +23,7 @@ from src.geometry.ground_plane import fit_ground_plane
 from src.obstacles.detector import detect_obstacles
 from src.obstacles.tracker import ObstacleTracker, Track
 from src.output.overlay import render_overlay
-from src.segmentation.boundary import corridor_mask, extract_boundaries
+from src.segmentation.boundary import SidewalkBoundary, corridor_mask, extract_boundaries
 
 
 class Pipeline:
@@ -58,10 +58,12 @@ class Pipeline:
 
         # Grid cache: the (H,W) int32 meshgrids built inside backproject are
         # re-used every frame instead of being allocated and freed per call.
-        # This eliminates the largest repeated allocation (4+ MB per call at
-        # 960x540, 16 MB at full 1080p) that was causing glibc's heap to grow
-        # without releasing memory back to the OS.
         self._grid_cache: dict = {}
+
+        cor_cfg = config["corridor"]
+        self._boundary_ema_alpha: float = float(cor_cfg.get("boundary_ema_alpha", 0.4))
+        self._max_corridor_width_m: float = float(cor_cfg.get("max_corridor_width_m", 4.0))
+        self._prev_boundary: SidewalkBoundary | None = None  # temporal EMA state
 
         t_cfg = config["tracking"]
         self._tracker = ObstacleTracker(
@@ -76,14 +78,20 @@ class Pipeline:
         depth_m: np.ndarray,
         mask: np.ndarray,
         frame_index: int | None = None,
+        boundary_mask: np.ndarray | None = None,
     ) -> tuple[np.ndarray, list[Track]]:
         """Run the full Stage B pipeline on one frame.
 
         Args:
             frame: uint8 BGR array (H, W, 3) — the original RGB frame.
             depth_m: float32 array (H, W) — metric depth in metres.
-            mask: uint8 array (H, W) — sidewalk mask (255 = sidewalk).
+            mask: uint8 array (H, W) — combined traversable mask (255 = walkable).
+                  Used for RANSAC ground-plane fitting.
             frame_index: optional frame number for the HUD overlay.
+            boundary_mask: optional uint8 (H, W) — sidewalk-only mask (class 1).
+                  When provided and sufficiently dense, used instead of *mask*
+                  for corridor boundary extraction so the corridor does not bleed
+                  into the car road.  Falls back to *mask* if None or too sparse.
 
         Returns:
             annotated_frame: uint8 BGR (H, W, 3) with overlay drawn on it.
@@ -99,13 +107,14 @@ class Pipeline:
             depth_m = depth_m[::s, ::s]
             mask = mask[::s, ::s]
             frame = frame[::s, ::s]
+            if boundary_mask is not None:
+                boundary_mask = boundary_mask[::s, ::s]
 
-        # Step 1 — back-project to 3-D using sidewalk mask
+        # Step 1 — back-project to 3-D using the full traversable mask (class 0+1)
         points, _ = backproject(depth_m, self._intrinsics, mask=mask,
                                 _grid_cache=self._grid_cache)
 
         if len(points) < gp_cfg["ransac_min_inliers"]:
-            # Not enough depth inside the mask — skip geometry, return plain frame
             return frame.copy(), []
 
         # Step 2 — fit ground plane (RANSAC)
@@ -114,28 +123,70 @@ class Pipeline:
             distance_threshold=gp_cfg["ransac_distance_threshold"],
             max_iterations=gp_cfg["ransac_max_iterations"],
             min_inliers=gp_cfg["ransac_min_inliers"],
+            max_input_points=gp_cfg.get("ransac_max_input_points", 15000),
         )
 
-        # Step 3 — extract sidewalk boundary from mask
-        boundary = extract_boundaries(
-            mask,
-            poly_degree=cor_cfg["boundary_poly_degree"],
-        )
+        # Step 3 — extract sidewalk boundary.
+        # Prefer the sidewalk-only mask (class 1) for boundaries so the corridor
+        # doesn't extend into the car road.  Fall back to the combined mask if
+        # the sidewalk-only mask is too sparse (cobblestone classified as road).
+        boundary: SidewalkBoundary | None = None
+        if boundary_mask is not None:
+            boundary = extract_boundaries(boundary_mask, poly_degree=cor_cfg["boundary_poly_degree"])
+        if boundary is None:
+            boundary = extract_boundaries(mask, poly_degree=cor_cfg["boundary_poly_degree"])
 
-        # Step 4 — detect obstacle candidates
+        # Temporal EMA smoothing: blend detected boundary with previous frame's.
+        # This eliminates jitter and "coasts" across gaps (parking entrances,
+        # missing curb sections) where boundary detection momentarily fails.
+        if boundary is not None:
+            if self._prev_boundary is not None:
+                alpha = self._boundary_ema_alpha
+                boundary = SidewalkBoundary(
+                    left_poly=(alpha * boundary.left_poly
+                                + (1.0 - alpha) * self._prev_boundary.left_poly),
+                    right_poly=(alpha * boundary.right_poly
+                                 + (1.0 - alpha) * self._prev_boundary.right_poly),
+                    valid_rows=boundary.valid_rows,
+                    poly_degree=boundary.poly_degree,
+                )
+            self._prev_boundary = boundary
+        else:
+            # No boundary this frame — coast on the last known good one
+            boundary = self._prev_boundary
+
+        # Step 4 — depth-aware corridor width cap.
+        # For each image row, compute max corridor width in pixels from the
+        # camera intrinsics and the ground-plane depth at that row.  This caps
+        # the right boundary so it cannot exceed left + max_width metres,
+        # preventing the corridor from spanning the full car road even when the
+        # combined traversable mask (class 0+1) is very wide.
+        max_width_px: np.ndarray | None = None
+        if plane is not None and boundary is not None:
+            _, b, c, d = plane
+            fy = self._intrinsics["fy"]
+            fx = self._intrinsics["fx"]
+            cy = self._intrinsics["cy"]
+            v_min = max(0, int(boundary.valid_rows.min()))
+            v_max = min(depth_m.shape[0] - 1, int(boundary.valid_rows.max()))
+            rows_f = np.arange(v_min, v_max + 1, dtype=np.float64)
+            # Ground-plane depth at the centre column for each row:
+            #   plane eq on camera ray → Z = -d / (b*(v-cy)/fy + c)
+            denom = b * (rows_f - cy) / fy + c
+            Z_row = np.where(np.abs(denom) > 1e-6, -d / denom, 50.0)
+            Z_row = np.clip(Z_row, 1.0, 50.0)
+            max_width_px = self._max_corridor_width_m * fx / Z_row
+
+        # Step 5 — detect obstacle candidates
         if plane is not None:
-            # Back-project pixels in/near the walkable corridor only — NOT the
-            # sidewalk mask (real obstacles are never classified as 'sidewalk',
-            # so masking to it would find zero obstacles), and NOT the entire
-            # frame either (sky/buildings outside the corridor can never be an
-            # in-path obstacle, so including them just wastes memory/time on
-            # multi-megapixel arrays every frame for no benefit).
             if boundary is not None:
                 search_mask = corridor_mask(
-                    depth_m.shape, boundary, margin=cor_cfg["corridor_margin"]
+                    depth_m.shape, boundary,
+                    margin=cor_cfg["corridor_margin"],
+                    max_width_px=max_width_px,
                 )
             else:
-                search_mask = None  # boundary extraction failed — fall back to full frame
+                search_mask = None
             all_points, all_pixels = backproject(depth_m, self._intrinsics, mask=search_mask,
                                                   _grid_cache=self._grid_cache)
             obstacles = detect_obstacles(

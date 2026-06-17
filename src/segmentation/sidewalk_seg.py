@@ -59,15 +59,22 @@ class SidewalkSegmenter:
         self.model.to(device)
         self.model.eval()
 
-    def segment(self, rgb_frame: np.ndarray) -> np.ndarray:
+    def segment(
+        self,
+        rgb_frame: np.ndarray,
+        return_class_map: bool = False,
+    ) -> np.ndarray | tuple[np.ndarray, np.ndarray]:
         """Produce a binary traversable-surface mask for one RGB frame.
 
         Args:
             rgb_frame: uint8 array of shape (H, W, 3).
+            return_class_map: if True, also return the raw per-pixel class map
+                (int16, shape (H, W)) so callers can derive class-specific masks
+                (e.g. class 1 = true sidewalk) without running inference twice.
 
         Returns:
-            binary_mask: uint8 array of shape (H, W).
-                         255 where the model predicts any traversable class, 0 elsewhere.
+            binary_mask: uint8 (H, W), 255 where any traversable class is predicted.
+            class_map (only when return_class_map=True): int16 (H, W), raw class index.
         """
         import torch
         from PIL import Image
@@ -81,7 +88,6 @@ class SidewalkSegmenter:
         with torch.no_grad():
             logits = self.model(**inputs).logits   # (1, num_classes, H/4, W/4)
 
-        # Upsample logits to original resolution, then argmax
         logits_up = torch.nn.functional.interpolate(
             logits,
             size=(H, W),
@@ -91,8 +97,9 @@ class SidewalkSegmenter:
 
         seg_map = logits_up.argmax(dim=1).squeeze(0).cpu().numpy()  # (H, W) int64
 
-        # Accept any pixel whose predicted class is in traversable_class_ids
         binary_mask = np.isin(seg_map, self.traversable_class_ids).astype(np.uint8) * 255
+        if return_class_map:
+            return binary_mask, seg_map.astype(np.int16)
         return binary_mask
 
 

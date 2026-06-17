@@ -105,12 +105,20 @@ def run_inference(
         depth_m = depth_est.estimate(rgb_frame)   # float32 (H, W)
 
         # --- Sidewalk segmentation ---
-        mask = seg.segment(rgb_frame)             # uint8 (H, W), 255=sidewalk
+        # return_class_map=True gives us the raw class indices alongside the
+        # combined binary mask, so we can also save a sidewalk-only mask (class 1)
+        # without running the model twice.
+        mask, class_map = seg.segment(rgb_frame, return_class_map=True)
+        # class 1 = Cityscapes "sidewalk" — the true pedestrian surface boundary.
+        # Stage B uses this narrower mask for corridor boundary extraction so the
+        # walkable corridor doesn't bleed into the car road (class 0).
+        sidewalk_mask = (class_map == 1).astype(np.uint8) * 255
 
         # --- Write outputs ---
         cv2.imwrite(str(out_dir / f"frame_{frame_idx:05d}.png"), bgr_frame)
         np.save(out_dir / f"depth_{frame_idx:05d}.npy", depth_m.astype(np.float16))
         cv2.imwrite(str(out_dir / f"mask_{frame_idx:05d}.png"), mask)
+        cv2.imwrite(str(out_dir / f"sidewalk_{frame_idx:05d}.png"), sidewalk_mask)
 
         written += 1
         raw_idx += 1

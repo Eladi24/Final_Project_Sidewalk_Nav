@@ -41,10 +41,15 @@ def collect_frame_indices(cache_dir: Path) -> list[int]:
     for f in sorted(cache_dir.glob("frame_*.png")):
         idx = int(f.stem.split("_")[1])
         depth_path = cache_dir / f"depth_{idx:05d}.npy"
-        mask_path = cache_dir / f"mask_{idx:05d}.png"
+        mask_path  = cache_dir / f"mask_{idx:05d}.png"
         if depth_path.exists() and mask_path.exists():
             indices.append(idx)
     return indices
+
+
+def has_sidewalk_masks(cache_dir: Path, indices: list[int]) -> bool:
+    """Return True if sidewalk-only masks exist for at least the first frame."""
+    return (cache_dir / f"sidewalk_{indices[0]:05d}.png").exists() if indices else False
 
 
 def main() -> None:
@@ -93,7 +98,9 @@ def main() -> None:
     if args.max_frames:
         indices = indices[: args.max_frames]
 
+    use_sidewalk_masks = has_sidewalk_masks(cache_dir, indices)
     print(f"Processing {len(indices)} frames from {cache_dir} ...")
+    print(f"  Sidewalk-only masks (class 1): {'YES — using for boundary extraction' if use_sidewalk_masks else 'NO — using combined mask + width cap'}")
 
     # Initialise VideoWriter using the first frame's dimensions
     first_frame = cv2.imread(str(cache_dir / f"frame_{indices[0]:05d}.png"))
@@ -115,13 +122,23 @@ def main() -> None:
     for frame_no, idx in enumerate(indices):
         frame = cv2.imread(str(cache_dir / f"frame_{idx:05d}.png"))
         depth = np.load(cache_dir / f"depth_{idx:05d}.npy")
-        mask = cv2.imread(str(cache_dir / f"mask_{idx:05d}.png"), cv2.IMREAD_GRAYSCALE)
+        mask  = cv2.imread(str(cache_dir / f"mask_{idx:05d}.png"), cv2.IMREAD_GRAYSCALE)
 
         if frame is None or mask is None:
             print(f"  [WARN] Skipping frame {idx} (missing file).")
             continue
 
-        annotated, tracks = pipeline.process_frame(frame, depth, mask, frame_index=idx)
+        boundary_mask = None
+        if use_sidewalk_masks:
+            boundary_mask = cv2.imread(
+                str(cache_dir / f"sidewalk_{idx:05d}.png"), cv2.IMREAD_GRAYSCALE
+            )
+
+        annotated, tracks = pipeline.process_frame(
+            frame, depth, mask,
+            frame_index=idx,
+            boundary_mask=boundary_mask,
+        )
 
         # If the pipeline ran at reduced resolution, upscale back for the video
         if annotated.shape[:2] != (H, W):
