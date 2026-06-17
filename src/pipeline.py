@@ -61,8 +61,20 @@ class Pipeline:
         self._grid_cache: dict = {}
 
         cor_cfg = config["corridor"]
-        self._boundary_ema_alpha: float = float(cor_cfg.get("boundary_ema_alpha", 0.4))
+        self._boundary_ema_alpha: float = float(cor_cfg.get("boundary_ema_alpha", 0.3))
         self._max_corridor_width_m: float = float(cor_cfg.get("max_corridor_width_m", 4.0))
+        self._max_boundary_jump_px: float = float(
+            cor_cfg.get("max_boundary_jump_px", 120)
+        )
+        # Minimum fraction of pixels that must be set in the sidewalk-only mask
+        # (class 1) for it to be used for boundary extraction.  Below this the
+        # mask is likely capturing only a thin curb strip or median rather than
+        # the actual walking surface, so we fall back to the combined mask +
+        # depth-aware width cap.  5 % is insufficient; 15 % is a safe lower bound
+        # for a genuinely detected sidewalk.
+        self._min_boundary_coverage: float = float(
+            cor_cfg.get("min_boundary_coverage", 0.15)
+        )
         self._prev_boundary: SidewalkBoundary | None = None  # temporal EMA state
 
         t_cfg = config["tracking"]
@@ -128,19 +140,45 @@ class Pipeline:
 
         # Step 3 — extract sidewalk boundary.
         # Prefer the sidewalk-only mask (class 1) for boundaries so the corridor
-        # doesn't extend into the car road.  Fall back to the combined mask if
-        # the sidewalk-only mask is too sparse (cobblestone classified as road).
+        # doesn't extend into the car road.  But only use it when it has enough
+        # coverage: < 15 % typically means the model detected a thin curb strip
+        # or raised median rather than the actual walking surface (common on
+        # cobblestone streets classified as road by Cityscapes-trained models).
+        # In that case fall back to the combined mask + depth-aware width cap.
         boundary: SidewalkBoundary | None = None
         if boundary_mask is not None:
-            boundary = extract_boundaries(boundary_mask, poly_degree=cor_cfg["boundary_poly_degree"])
+            coverage = float((boundary_mask > 127).mean())
+            if coverage >= self._min_boundary_coverage:
+                boundary = extract_boundaries(
+                    boundary_mask, poly_degree=cor_cfg["boundary_poly_degree"]
+                )
         if boundary is None:
             boundary = extract_boundaries(mask, poly_degree=cor_cfg["boundary_poly_degree"])
 
         # Temporal EMA smoothing: blend detected boundary with previous frame's.
         # This eliminates jitter and "coasts" across gaps (parking entrances,
         # missing curb sections) where boundary detection momentarily fails.
+        #
+        # Jump rejection: if the new boundary has moved more than max_boundary_jump_px
+        # pixels at the mid-row relative to the previous frame, the mask is likely
+        # distorted by a transient (car driving past, parking entrance, shadow).
+        # In that case, discard the new observation and coast on the previous boundary
+        # rather than blending a wildly wrong polynomial into the EMA state.
+        if boundary is not None and self._prev_boundary is not None:
+            mid_row = float(np.median(boundary.valid_rows))
+            right_jump = abs(
+                np.polyval(boundary.right_poly, mid_row)
+                - np.polyval(self._prev_boundary.right_poly, mid_row)
+            )
+            left_jump = abs(
+                np.polyval(boundary.left_poly, mid_row)
+                - np.polyval(self._prev_boundary.left_poly, mid_row)
+            )
+            if right_jump > self._max_boundary_jump_px or left_jump > self._max_boundary_jump_px:
+                boundary = self._prev_boundary  # coast — ignore this frame's boundary
+
         if boundary is not None:
-            if self._prev_boundary is not None:
+            if self._prev_boundary is not None and boundary is not self._prev_boundary:
                 alpha = self._boundary_ema_alpha
                 boundary = SidewalkBoundary(
                     left_poly=(alpha * boundary.left_poly
@@ -150,7 +188,8 @@ class Pipeline:
                     valid_rows=boundary.valid_rows,
                     poly_degree=boundary.poly_degree,
                 )
-            self._prev_boundary = boundary
+            if boundary is not self._prev_boundary:
+                self._prev_boundary = boundary
         else:
             # No boundary this frame — coast on the last known good one
             boundary = self._prev_boundary
@@ -177,23 +216,53 @@ class Pipeline:
             Z_row = np.clip(Z_row, 1.0, 50.0)
             max_width_px = self._max_corridor_width_m * fx / Z_row
 
-        # Step 5 — detect obstacle candidates
+        # Step 5 — build capped visual boundary for rendering.
+        # The EMA boundary polynomials are uncapped (wide).  Re-fit the right
+        # polynomial to the capped values so the green fill matches exactly the
+        # area that is actually searched for obstacles — otherwise the user sees
+        # the corridor extending into the road/median while the detection happens
+        # only on the narrower sidewalk.
+        visual_boundary = boundary
+        if max_width_px is not None and boundary is not None:
+            v_min_vis = max(0, int(boundary.valid_rows.min()))
+            v_max_vis = min(depth_m.shape[0] - 1, int(boundary.valid_rows.max()))
+            rows_vis  = np.arange(v_min_vis, v_max_vis + 1, dtype=np.float64)
+            left_vis  = np.polyval(boundary.left_poly,  rows_vis)
+            right_vis = np.polyval(boundary.right_poly, rows_vis)
+            right_vis_capped = np.minimum(right_vis, left_vis + max_width_px)
+            right_poly_capped = np.polyfit(rows_vis, right_vis_capped, boundary.poly_degree)
+            visual_boundary = SidewalkBoundary(
+                left_poly=boundary.left_poly,
+                right_poly=right_poly_capped,
+                valid_rows=boundary.valid_rows,
+                poly_degree=boundary.poly_degree,
+            )
+
+        # Step 6 — detect obstacle candidates.
+        # IMPORTANT: use the UNCAPPED boundary for the search area, not visual_boundary.
+        # The visual_boundary is clipped to max_corridor_width_m to keep the green fill
+        # off the car road — but that clip also excludes edge obstacles (parked cars,
+        # utility poles at the sidewalk/road boundary).  The wider uncapped boundary
+        # includes those objects.  The height threshold filters out flat ground anyway,
+        # so the extra area does not cause ground-surface false positives.
         if plane is not None:
             if boundary is not None:
                 search_mask = corridor_mask(
                     depth_m.shape, boundary,
                     margin=cor_cfg["corridor_margin"],
-                    max_width_px=max_width_px,
                 )
             else:
                 search_mask = None
             all_points, all_pixels = backproject(depth_m, self._intrinsics, mask=search_mask,
                                                   _grid_cache=self._grid_cache)
+            # Pass boundary=None: search_mask already filters points to the corridor
+            # so calling points_in_corridor inside detect_obstacles would apply the
+            # margin a second time and silently discard obstacles near the walls.
             obstacles = detect_obstacles(
                 all_points,
                 all_pixels,
                 plane,
-                boundary,
+                boundary=None,
                 height_threshold=obs_cfg["height_threshold"],
                 dbscan_eps=obs_cfg["dbscan_eps"],
                 dbscan_min_samples=obs_cfg["dbscan_min_samples"],
@@ -204,7 +273,7 @@ class Pipeline:
         else:
             obstacles = []
 
-        # Step 5 — update tracker
+        # Step 7 — update tracker
         active_tracks = self._tracker.update(obstacles)
 
         # Attach bbox from the matching obstacle to each track (best effort)
@@ -220,11 +289,11 @@ class Pipeline:
                 else:
                     track.bbox_px = (0, 0, 1, 1)  # type: ignore[attr-defined]
 
-        # Step 6 — render overlay
+        # Step 8 — render overlay using the CAPPED visual boundary
         annotated = render_overlay(
             frame,
             active_tracks,
-            boundary=boundary,
+            boundary=visual_boundary,
             corridor_margin=cor_cfg["corridor_margin"],
             frame_index=frame_index,
         )
