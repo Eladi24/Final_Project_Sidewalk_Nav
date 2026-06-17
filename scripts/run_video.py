@@ -23,6 +23,8 @@ import argparse
 import sys
 from pathlib import Path
 
+import gc
+
 import cv2
 import numpy as np
 
@@ -120,6 +122,11 @@ def main() -> None:
             continue
 
         annotated, tracks = pipeline.process_frame(frame, depth, mask, frame_index=idx)
+
+        # If the pipeline ran at reduced resolution, upscale back for the video
+        if annotated.shape[:2] != (H, W):
+            annotated = cv2.resize(annotated, (W, H), interpolation=cv2.INTER_LINEAR)
+
         writer.write(annotated)
 
         if alerter and tracks:
@@ -129,6 +136,7 @@ def main() -> None:
 
         if (frame_no + 1) % 50 == 0:
             print(f"  {frame_no + 1}/{len(indices)} frames done …")
+            gc.collect()
 
     writer.release()
     print(f"Annotated video written to {out_path}")

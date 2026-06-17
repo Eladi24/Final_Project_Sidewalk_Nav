@@ -66,6 +66,7 @@ def detect_obstacles(
     dbscan_min_samples: int = 10,
     min_cluster_size: int = 15,
     corridor_margin: int = 20,
+    max_candidate_points: int = 50_000,
 ) -> list[Obstacle]:
     """Detect obstacles in a single frame's point cloud.
 
@@ -80,6 +81,14 @@ def detect_obstacles(
         dbscan_min_samples: DBSCAN core-point density.
         min_cluster_size: discard clusters with fewer points.
         corridor_margin: pixel inset passed to points_in_corridor.
+        max_candidate_points: hard cap on candidates passed to DBSCAN. A noisy
+            boundary polynomial can occasionally over-extend the corridor on a
+            particular frame (sparse/odd mask data → a bad curve fit far outside
+            the densely-sampled rows), producing a candidate set much larger
+            than any real obstacle scene needs. Real obstacle clusters are
+            dense, so randomly subsampling beyond this cap doesn't change which
+            clusters get found — it just bounds the worst-case cost regardless
+            of why the candidate set got large.
 
     Returns:
         List of Obstacle objects, sorted by distance (nearest first).
@@ -106,6 +115,12 @@ def detect_obstacles(
 
     cand_points = points[candidates]   # (M, 3)
     cand_pixels = pixels[candidates]   # (M, 2)
+
+    if len(cand_points) > max_candidate_points:
+        rng = np.random.default_rng(0)
+        keep = rng.choice(len(cand_points), size=max_candidate_points, replace=False)
+        cand_points = cand_points[keep]
+        cand_pixels = cand_pixels[keep]
 
     # --- 3. DBSCAN clustering (in 3-D metric space) ---
     db = DBSCAN(eps=dbscan_eps, min_samples=dbscan_min_samples, n_jobs=1)
@@ -153,7 +168,7 @@ if __name__ == "__main__":
     import cv2
     from src.geometry.backprojection import backproject
     from src.geometry.ground_plane import fit_ground_plane
-    from src.segmentation.boundary import extract_boundaries
+    from src.segmentation.boundary import corridor_mask, extract_boundaries
     from src.config import load_config
 
     parser = argparse.ArgumentParser(description="Detect obstacles in a cached frame")
@@ -173,6 +188,7 @@ if __name__ == "__main__":
     mask = cv2.imread(str(frame_dir / f"mask_{idx:05d}.png"), cv2.IMREAD_GRAYSCALE)
     frame = cv2.imread(str(frame_dir / f"frame_{idx:05d}.png"))
 
+    # Ground plane is fit on sidewalk-only points (mask=mask).
     points, pix = backproject(depth, K, mask=mask)
     plane, inliers = fit_ground_plane(points, **cfg["ground_plane"])
     if plane is None:
@@ -180,14 +196,26 @@ if __name__ == "__main__":
         sys.exit(1)
 
     boundary = extract_boundaries(mask, poly_degree=cfg["corridor"]["boundary_poly_degree"])
+
+    # Obstacles are searched in the corridor band, NOT the sidewalk mask —
+    # real obstacles (poles, people, bins) are never classified as 'sidewalk',
+    # so restricting to that mask would always find zero obstacles.
+    if boundary is not None:
+        search_mask = corridor_mask(depth.shape, boundary,
+                                    margin=cfg["corridor"]["corridor_margin"])
+    else:
+        search_mask = None
+    search_points, search_pix = backproject(depth, K, mask=search_mask)
+
     obs_cfg = cfg["obstacles"]
     obstacles = detect_obstacles(
-        points, pix, plane, boundary,
+        search_points, search_pix, plane, boundary,
         height_threshold=obs_cfg["height_threshold"],
         dbscan_eps=obs_cfg["dbscan_eps"],
         dbscan_min_samples=obs_cfg["dbscan_min_samples"],
         min_cluster_size=obs_cfg["min_cluster_size"],
         corridor_margin=cfg["corridor"]["corridor_margin"],
+        max_candidate_points=obs_cfg["max_candidate_points"],
     )
 
     print(f"Detected {len(obstacles)} obstacle(s):")

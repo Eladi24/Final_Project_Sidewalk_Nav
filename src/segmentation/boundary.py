@@ -125,6 +125,50 @@ def points_in_corridor(
     return in_row_range & (u >= left_u) & (u <= right_u)
 
 
+def corridor_mask(
+    shape: tuple[int, int],
+    boundary: SidewalkBoundary,
+    margin: int = 20,
+) -> np.ndarray:
+    """Rasterize the walkable corridor into a full-resolution boolean mask.
+
+    This restricts a downstream back-projection to a bounded region of the
+    frame instead of every pixel — sky, building facades, and anything far
+    outside the corridor can never contain a sidewalk obstacle, so excluding
+    them up front avoids back-projecting (and clustering) millions of
+    irrelevant pixels per frame. Equivalent in result to back-projecting
+    everything and calling :func:`points_in_corridor` afterward, just far
+    cheaper in memory and time.
+
+    Args:
+        shape: (H, W) of the target frame.
+        boundary: fitted SidewalkBoundary from :func:`extract_boundaries`.
+        margin: same safety inset used by :func:`points_in_corridor`.
+
+    Returns:
+        mask: bool array of shape (H, W), True inside the corridor band.
+    """
+    H, W = shape
+    mask = np.zeros((H, W), dtype=bool)
+
+    v_min = max(0, int(boundary.valid_rows.min()))
+    v_max = min(H - 1, int(boundary.valid_rows.max()))
+    if v_max < v_min:
+        return mask
+
+    rows = np.arange(v_min, v_max + 1)
+    left_u = np.polyval(boundary.left_poly, rows) + margin
+    right_u = np.polyval(boundary.right_poly, rows) - margin
+
+    u_grid = np.arange(W)
+    # Vectorised per-row band: True where left_u[row] <= u <= right_u[row]
+    row_band = (u_grid[np.newaxis, :] >= left_u[:, np.newaxis]) & \
+               (u_grid[np.newaxis, :] <= right_u[:, np.newaxis])
+    mask[v_min:v_max + 1, :] = row_band
+
+    return mask
+
+
 def draw_boundaries(
     frame: np.ndarray,
     boundary: SidewalkBoundary,

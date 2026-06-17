@@ -37,15 +37,21 @@ def backproject(
     depth_m: np.ndarray,
     intrinsics: dict,
     mask: np.ndarray | None = None,
+    _grid_cache: dict | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Back-project a depth map to a 3-D point cloud.
 
     Args:
-        depth_m: float32 array of shape (H, W). Depth in metres.
+        depth_m: float32 (or float16) array of shape (H, W). Depth in metres.
         intrinsics: dict with keys ``fx``, ``fy``, ``cx``, ``cy`` (all floats).
         mask: optional uint8 array of shape (H, W). Only pixels where
               ``mask > 127`` are back-projected.  If ``None``, all valid
               (depth > 0) pixels are used.
+        _grid_cache: optional dict for reusing the pixel-coordinate meshgrid
+              across calls of the same resolution.  Pass the same dict object
+              every call to avoid re-allocating the (H, W) int32 grids each
+              time.  The cache is keyed by (H, W) so a resolution change
+              triggers a rebuild automatically.
 
     Returns:
         points: float32 array of shape (N, 3) — 3-D (X, Y, Z) in metres.
@@ -58,8 +64,22 @@ def backproject(
     cx = float(intrinsics["cx"])
     cy = float(intrinsics["cy"])
 
-    # Build pixel coordinate grids (vectorised — no loops)
-    u_grid, v_grid = np.meshgrid(np.arange(W), np.arange(H))  # both (H, W)
+    # Pixel-coordinate meshgrids: int32 is sufficient for any resolution
+    # (max coord ~65k << 2^31) and uses half the memory of the default int64.
+    # With _grid_cache, the two (H,W) int32 arrays are built ONCE per pipeline
+    # and reused every frame, eliminating the largest repeated allocation.
+    if _grid_cache is not None and _grid_cache.get("shape") == (H, W):
+        u_grid = _grid_cache["u"]
+        v_grid = _grid_cache["v"]
+    else:
+        u_grid, v_grid = np.meshgrid(
+            np.arange(W, dtype=np.int32),
+            np.arange(H, dtype=np.int32),
+        )
+        if _grid_cache is not None:
+            _grid_cache["shape"] = (H, W)
+            _grid_cache["u"] = u_grid
+            _grid_cache["v"] = v_grid
 
     # Validity: positive depth, and inside mask (if provided)
     valid = depth_m > 0.0
@@ -68,13 +88,13 @@ def backproject(
 
     u_valid = u_grid[valid].astype(np.float32)   # shape (N,)
     v_valid = v_grid[valid].astype(np.float32)
-    Z = depth_m[valid]                            # shape (N,)
+    Z = depth_m[valid].astype(np.float32)         # handles float16 input too
 
     X = (u_valid - cx) * Z / fx
     Y = (v_valid - cy) * Z / fy
 
-    points = np.stack([X, Y, Z], axis=1)                        # (N, 3)
-    pixels = np.stack([u_grid[valid], v_grid[valid]], axis=1).astype(np.int32)  # (N, 2)
+    points = np.stack([X, Y, Z], axis=1)                        # (N, 3) float32
+    pixels = np.stack([u_grid[valid], v_grid[valid]], axis=1)   # (N, 2) int32
 
     return points, pixels
 

@@ -23,7 +23,7 @@ from src.geometry.ground_plane import fit_ground_plane
 from src.obstacles.detector import detect_obstacles
 from src.obstacles.tracker import ObstacleTracker, Track
 from src.output.overlay import render_overlay
-from src.segmentation.boundary import extract_boundaries
+from src.segmentation.boundary import corridor_mask, extract_boundaries
 
 
 class Pipeline:
@@ -39,6 +39,29 @@ class Pipeline:
         intrinsics_path = config["camera"]["intrinsics"]
         with open(intrinsics_path) as fh:
             self._intrinsics = json.load(fh)
+
+        # Spatial stride: downsample depth/mask/frame before geometry to cut
+        # per-frame memory by stride^2. The meshgrid in backproject is the main
+        # offender — (H,W) int64 × 2 per call × 2 calls/frame = 66 MB at 1080p.
+        # At stride=2 (960×540) that drops to ~16 MB. RANSAC and DBSCAN produce
+        # identical results because their distances are metric (metres), not pixels.
+        self._stride = int(config.get("performance", {}).get("spatial_stride", 1))
+        if self._stride > 1:
+            s = float(self._stride)
+            self._intrinsics = {
+                **self._intrinsics,
+                "fx": self._intrinsics["fx"] / s,
+                "fy": self._intrinsics["fy"] / s,
+                "cx": self._intrinsics["cx"] / s,
+                "cy": self._intrinsics["cy"] / s,
+            }
+
+        # Grid cache: the (H,W) int32 meshgrids built inside backproject are
+        # re-used every frame instead of being allocated and freed per call.
+        # This eliminates the largest repeated allocation (4+ MB per call at
+        # 960x540, 16 MB at full 1080p) that was causing glibc's heap to grow
+        # without releasing memory back to the OS.
+        self._grid_cache: dict = {}
 
         t_cfg = config["tracking"]
         self._tracker = ObstacleTracker(
@@ -70,8 +93,16 @@ class Pipeline:
         obs_cfg = self._cfg["obstacles"]
         cor_cfg = self._cfg["corridor"]
 
+        # Downsample all inputs if spatial_stride > 1 (intrinsics already scaled in __init__)
+        if self._stride > 1:
+            s = self._stride
+            depth_m = depth_m[::s, ::s]
+            mask = mask[::s, ::s]
+            frame = frame[::s, ::s]
+
         # Step 1 — back-project to 3-D using sidewalk mask
-        points, _ = backproject(depth_m, self._intrinsics, mask=mask)
+        points, _ = backproject(depth_m, self._intrinsics, mask=mask,
+                                _grid_cache=self._grid_cache)
 
         if len(points) < gp_cfg["ransac_min_inliers"]:
             # Not enough depth inside the mask — skip geometry, return plain frame
@@ -93,8 +124,20 @@ class Pipeline:
 
         # Step 4 — detect obstacle candidates
         if plane is not None:
-            # Back-project ALL pixels (not masked) to find obstacles
-            all_points, all_pixels = backproject(depth_m, self._intrinsics, mask=None)
+            # Back-project pixels in/near the walkable corridor only — NOT the
+            # sidewalk mask (real obstacles are never classified as 'sidewalk',
+            # so masking to it would find zero obstacles), and NOT the entire
+            # frame either (sky/buildings outside the corridor can never be an
+            # in-path obstacle, so including them just wastes memory/time on
+            # multi-megapixel arrays every frame for no benefit).
+            if boundary is not None:
+                search_mask = corridor_mask(
+                    depth_m.shape, boundary, margin=cor_cfg["corridor_margin"]
+                )
+            else:
+                search_mask = None  # boundary extraction failed — fall back to full frame
+            all_points, all_pixels = backproject(depth_m, self._intrinsics, mask=search_mask,
+                                                  _grid_cache=self._grid_cache)
             obstacles = detect_obstacles(
                 all_points,
                 all_pixels,
@@ -105,6 +148,7 @@ class Pipeline:
                 dbscan_min_samples=obs_cfg["dbscan_min_samples"],
                 min_cluster_size=obs_cfg["min_cluster_size"],
                 corridor_margin=cor_cfg["corridor_margin"],
+                max_candidate_points=obs_cfg["max_candidate_points"],
             )
         else:
             obstacles = []

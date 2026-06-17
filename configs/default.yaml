@@ -25,6 +25,10 @@ obstacles:
   dbscan_eps: 0.5                   # neighborhood radius in meters
   dbscan_min_samples: 10            # DBSCAN core-point density requirement
   min_cluster_size: 15              # discard clusters smaller than this (noise)
+  max_candidate_points: 50000       # hard cap on points fed to DBSCAN per frame —
+                                     # protects against pathological frames (e.g. a
+                                     # noisy boundary fit over-extending the corridor)
+                                     # regardless of cause; random subsample beyond this
 
 # Sidewalk corridor (src/segmentation/boundary.py)
 corridor:
@@ -45,4 +49,15 @@ depth:
 # Stage A — SegFormer (src/segmentation/sidewalk_seg.py)
 segmentation:
   model_name: "nvidia/segformer-b2-finetuned-cityscapes-1024-1024"
-  sidewalk_class_id: 1              # Cityscapes: 0=road, 1=sidewalk, 2=building …
+  # Cityscapes classes: 0=road, 1=sidewalk, 2=building, 3=wall, 4=fence ...
+  # Include class 0 (road) because cobblestone/brick sidewalks are often
+  # misclassified as road by a model trained on smooth European pavement.
+  traversable_class_ids: [0, 1]
+
+# Performance — memory reduction for Stage B on low-RAM machines
+performance:
+  spatial_stride: 2     # downsample depth/mask/frame by this factor before geometry.
+                        # 1 = full resolution (needs ~16 GB for 1080p)
+                        # 2 = half res, 4× less memory — recommended for 1080p on ≤8 GB RAM
+                        # 4 = quarter res, if RAM is still tight
+                        # DBSCAN (eps=0.5 m) and RANSAC produce identical results at stride 2.

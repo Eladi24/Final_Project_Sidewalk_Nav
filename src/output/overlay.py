@@ -96,7 +96,7 @@ if __name__ == "__main__":
 
     from src.geometry.backprojection import backproject
     from src.geometry.ground_plane import fit_ground_plane
-    from src.segmentation.boundary import extract_boundaries
+    from src.segmentation.boundary import corridor_mask, extract_boundaries
     from src.obstacles.detector import detect_obstacles
     from src.obstacles.tracker import ObstacleTracker, Track
     from src.config import load_config
@@ -124,19 +124,30 @@ if __name__ == "__main__":
         print(f"ERROR: cannot read frame_{idx:05d}.png", file=sys.stderr)
         sys.exit(1)
 
+    # Ground plane is fit on sidewalk-only points (mask=mask).
     points, pix = backproject(depth, K, mask=mask)
     plane, _ = fit_ground_plane(points, **cfg["ground_plane"])
     boundary = extract_boundaries(mask, poly_degree=cfg["corridor"]["boundary_poly_degree"])
 
     obs_cfg = cfg["obstacles"]
     if plane is not None:
+        # Obstacles are searched in the corridor band, NOT the sidewalk mask —
+        # real obstacles (poles, people, bins) are never classified as
+        # 'sidewalk', so restricting to that mask would always find zero.
+        if boundary is not None:
+            search_mask = corridor_mask(depth.shape, boundary,
+                                        margin=cfg["corridor"]["corridor_margin"])
+        else:
+            search_mask = None
+        search_points, search_pix = backproject(depth, K, mask=search_mask)
         obstacles = detect_obstacles(
-            points, pix, plane, boundary,
+            search_points, search_pix, plane, boundary,
             height_threshold=obs_cfg["height_threshold"],
             dbscan_eps=obs_cfg["dbscan_eps"],
             dbscan_min_samples=obs_cfg["dbscan_min_samples"],
             min_cluster_size=obs_cfg["min_cluster_size"],
             corridor_margin=cfg["corridor"]["corridor_margin"],
+            max_candidate_points=obs_cfg["max_candidate_points"],
         )
     else:
         obstacles = []

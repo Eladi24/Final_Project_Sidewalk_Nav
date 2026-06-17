@@ -41,7 +41,7 @@ def run_inference(
     out_dir: str | Path,
     depth_model: str = "depth-anything/Depth-Anything-V2-Metric-Outdoor-Small-hf",
     seg_model: str = "nvidia/segformer-b2-finetuned-cityscapes-1024-1024",
-    sidewalk_class_id: int = 1,
+    traversable_class_ids: list[int] | None = None,
     device: str = "cuda",
     every_nth: int = 1,
 ) -> None:
@@ -52,7 +52,9 @@ def run_inference(
         out_dir: Output directory for the cache (created if needed).
         depth_model: HuggingFace model ID for Depth Anything V2 metric.
         seg_model: HuggingFace model ID for SegFormer Cityscapes.
-        sidewalk_class_id: Cityscapes label index for 'sidewalk' (default 1).
+        traversable_class_ids: Cityscapes class indices to treat as walkable.
+            Default ``[0, 1]`` (road + sidewalk). Cobblestone/brick sidewalks
+            are typically classified as road (0) by a Cityscapes-trained model.
         device: ``"cuda"`` (recommended) or ``"cpu"``.
         every_nth: process only every N-th frame (1 = every frame).
     """
@@ -60,14 +62,19 @@ def run_inference(
     from src.depth.depth_estimator import DepthEstimator
     from src.segmentation.sidewalk_seg import SidewalkSegmenter
 
+    if traversable_class_ids is None:
+        traversable_class_ids = [0, 1]
+
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"Loading models on {device} ...")
+    print(f"Traversable classes: {traversable_class_ids} "
+          f"({', '.join(['road' if c==0 else 'sidewalk' if c==1 else str(c) for c in traversable_class_ids])})")
     depth_est = DepthEstimator(model_name=depth_model, device=device)
     seg = SidewalkSegmenter(
         model_name=seg_model,
-        sidewalk_class_id=sidewalk_class_id,
+        traversable_class_ids=traversable_class_ids,
         device=device,
     )
 
@@ -102,7 +109,7 @@ def run_inference(
 
         # --- Write outputs ---
         cv2.imwrite(str(out_dir / f"frame_{frame_idx:05d}.png"), bgr_frame)
-        np.save(out_dir / f"depth_{frame_idx:05d}.npy", depth_m)
+        np.save(out_dir / f"depth_{frame_idx:05d}.npy", depth_m.astype(np.float16))
         cv2.imwrite(str(out_dir / f"mask_{frame_idx:05d}.png"), mask)
 
         written += 1
@@ -130,7 +137,10 @@ if __name__ == "__main__":
         "--seg-model",
         default="nvidia/segformer-b2-finetuned-cityscapes-1024-1024",
     )
-    parser.add_argument("--sidewalk-class", type=int, default=1)
+    parser.add_argument(
+        "--traversable-classes", type=int, nargs="+", default=[0, 1],
+        help="Cityscapes class IDs to treat as walkable (default: 0 1 = road+sidewalk)"
+    )
     parser.add_argument("--device", default="cuda",
                         help="'cuda' (recommended on Colab) or 'cpu'")
     parser.add_argument(
@@ -148,7 +158,7 @@ if __name__ == "__main__":
             out_dir=args.out,
             depth_model=args.depth_model,
             seg_model=args.seg_model,
-            sidewalk_class_id=args.sidewalk_class,
+            traversable_class_ids=args.traversable_classes,
             device=args.device,
             every_nth=args.every,
         )

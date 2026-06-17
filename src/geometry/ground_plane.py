@@ -94,6 +94,20 @@ def fit_ground_plane(
     best_inlier_count = 0
     best_inlier_mask = np.zeros(N, dtype=bool)
 
+    # Preallocate scratch buffers ONCE and reuse them in-place for every
+    # iteration below, instead of allocating fresh `dists`/`inlier_mask`
+    # arrays on each of up to `max_iterations` passes. With large point
+    # clouds (hundreds of thousands of points) and max_iterations=1000,
+    # the naive version allocates/frees gigabytes of short-lived arrays per
+    # call — harmless on its own, but across hundreds of video frames this
+    # rapid alloc/free churn fragments the memory allocator and can drive
+    # RSS up until the OS kills the process. Reusing buffers makes this loop
+    # allocate nothing after setup, regardless of max_iterations.
+    x, y, z = points[:, 0], points[:, 1], points[:, 2]
+    dists = np.empty(N, dtype=np.float64)
+    tmp = np.empty(N, dtype=np.float64)
+    inlier_mask = np.empty(N, dtype=bool)
+
     for _ in range(max_iterations):
         idx = rng.choice(N, size=3, replace=False)
         p1, p2, p3 = points[idx[0]], points[idx[1]], points[idx[2]]
@@ -103,14 +117,22 @@ def fit_ground_plane(
             continue  # collinear sample, skip
 
         a, b, c, d = plane
-        # Signed distances (unit normal, so no division)
-        dists = np.abs(points[:, 0] * a + points[:, 1] * b + points[:, 2] * c + d)
-        inlier_mask = dists < distance_threshold
+        # Signed distances (unit normal, so no division), computed in-place
+        # into the preallocated `dists`/`tmp` buffers — no new arrays.
+        np.multiply(x, a, out=dists)
+        np.multiply(y, b, out=tmp)
+        dists += tmp
+        np.multiply(z, c, out=tmp)
+        dists += tmp
+        dists += d
+        np.abs(dists, out=dists)
+        np.less(dists, distance_threshold, out=inlier_mask)
         inlier_count = int(inlier_mask.sum())
 
         if inlier_count > best_inlier_count:
             best_inlier_count = inlier_count
-            best_inlier_mask = inlier_mask
+            # inlier_mask is reused next iteration — must copy to keep this one
+            best_inlier_mask = inlier_mask.copy()
             best_plane = plane
 
     if best_plane is None or best_inlier_count < min_inliers:

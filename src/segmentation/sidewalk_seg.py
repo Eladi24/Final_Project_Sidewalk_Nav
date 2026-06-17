@@ -35,35 +35,39 @@ class SidewalkSegmenter:
 
     Args:
         model_name: HuggingFace model ID.
-        sidewalk_class_id: Cityscapes class index for 'sidewalk' (default 1).
+        traversable_class_ids: list of Cityscapes class indices to treat as
+            walkable surface.  Default ``[1]`` (sidewalk only).  For footage
+            where the pavement is classified as road (class 0) — common with
+            cobblestone / brick sidewalks that differ from Cityscapes training
+            data — pass ``[0, 1]`` to include both road and sidewalk.
         device: ``"cuda"`` or ``"cpu"``.
     """
 
     def __init__(
         self,
         model_name: str = "nvidia/segformer-b2-finetuned-cityscapes-1024-1024",
-        sidewalk_class_id: int = 1,
+        traversable_class_ids: list[int] | None = None,
         device: str = "cuda",
     ) -> None:
         import torch
         from transformers import SegformerForSemanticSegmentation, SegformerImageProcessor
 
         self.device = device
-        self.sidewalk_class_id = sidewalk_class_id
+        self.traversable_class_ids = traversable_class_ids if traversable_class_ids is not None else [1]
         self.processor = SegformerImageProcessor.from_pretrained(model_name)
         self.model = SegformerForSemanticSegmentation.from_pretrained(model_name)
         self.model.to(device)
         self.model.eval()
 
     def segment(self, rgb_frame: np.ndarray) -> np.ndarray:
-        """Produce a binary sidewalk mask for one RGB frame.
+        """Produce a binary traversable-surface mask for one RGB frame.
 
         Args:
             rgb_frame: uint8 array of shape (H, W, 3).
 
         Returns:
             binary_mask: uint8 array of shape (H, W).
-                         255 where the model predicts 'sidewalk', 0 elsewhere.
+                         255 where the model predicts any traversable class, 0 elsewhere.
         """
         import torch
         from PIL import Image
@@ -87,7 +91,8 @@ class SidewalkSegmenter:
 
         seg_map = logits_up.argmax(dim=1).squeeze(0).cpu().numpy()  # (H, W) int64
 
-        binary_mask = np.where(seg_map == self.sidewalk_class_id, 255, 0).astype(np.uint8)
+        # Accept any pixel whose predicted class is in traversable_class_ids
+        binary_mask = np.isin(seg_map, self.traversable_class_ids).astype(np.uint8) * 255
         return binary_mask
 
 
