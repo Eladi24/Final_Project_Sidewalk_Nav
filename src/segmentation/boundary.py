@@ -115,8 +115,16 @@ def points_in_corridor(
     u = pixels[:, 0].astype(np.float64)
     v = pixels[:, 1].astype(np.float64)
 
-    left_u = np.polyval(boundary.left_poly, v) + margin
-    right_u = np.polyval(boundary.right_poly, v) - margin
+    left_raw = np.polyval(boundary.left_poly, v)
+    right_raw = np.polyval(boundary.right_poly, v)
+    actual_width = np.maximum(0, right_raw - left_raw)
+    if margin >= 0:
+        safe_margin = np.maximum(0, np.minimum(margin, (actual_width - 2) / 2.0))
+    else:
+        safe_margin = np.full_like(actual_width, margin)
+    
+    left_u = left_raw + safe_margin
+    right_u = right_raw - safe_margin
 
     v_min = float(boundary.valid_rows.min())
     v_max = float(boundary.valid_rows.max())
@@ -150,10 +158,11 @@ def corridor_mask(
             intrinsics as ``max_width_m * fx / Z_row``.
 
     Returns:
-        mask: bool array of shape (H, W), True inside the corridor band.
+        mask: uint8 array of shape (H, W), 255 inside the corridor band.
     """
+    import cv2
     H, W = shape
-    mask = np.zeros((H, W), dtype=bool)
+    mask = np.zeros((H, W), dtype=np.uint8)
 
     v_min = max(0, int(boundary.valid_rows.min()))
     v_max = min(H - 1, int(boundary.valid_rows.max()))
@@ -161,8 +170,16 @@ def corridor_mask(
         return mask
 
     rows = np.arange(v_min, v_max + 1)
-    left_u  = np.polyval(boundary.left_poly,  rows) + margin
-    right_u = np.polyval(boundary.right_poly, rows) - margin
+    left_raw  = np.polyval(boundary.left_poly,  rows)
+    right_raw = np.polyval(boundary.right_poly, rows)
+    actual_width = np.maximum(0, right_raw - left_raw)
+    if margin >= 0:
+        safe_margin = np.maximum(0, np.minimum(margin, (actual_width - 2) / 2.0))
+    else:
+        safe_margin = np.full_like(actual_width, margin)
+    
+    left_u  = left_raw + safe_margin
+    right_u = right_raw - safe_margin
 
     # Physical width cap: right boundary cannot exceed left + max allowed width.
     # This prevents the corridor from spanning the car road when the traversable
@@ -170,10 +187,14 @@ def corridor_mask(
     if max_width_px is not None:
         right_u = np.minimum(right_u, left_u + max_width_px)
 
-    u_grid = np.arange(W)
-    row_band = (u_grid[np.newaxis, :] >= left_u[:, np.newaxis]) & \
-               (u_grid[np.newaxis, :] <= right_u[:, np.newaxis])
-    mask[v_min:v_max + 1, :] = row_band
+    left_fill = left_u.astype(np.int32)
+    right_fill = right_u.astype(np.int32)
+    vs = rows.astype(np.int32)
+    
+    pts_left = np.stack([left_fill, vs], axis=1)
+    pts_right = np.stack([right_fill, vs], axis=1)
+    polygon = np.concatenate([pts_left, pts_right[::-1]], axis=0).reshape(-1, 1, 2)
+    cv2.fillPoly(mask, [polygon], 255)
 
     return mask
 
@@ -207,18 +228,28 @@ def draw_boundaries(
     H = frame.shape[0]
     vs = np.arange(int(boundary.valid_rows.min()), int(boundary.valid_rows.max()) + 1)
 
-    left_us = np.polyval(boundary.left_poly, vs).astype(np.int32)
-    right_us = np.polyval(boundary.right_poly, vs).astype(np.int32)
+    left_raw = np.polyval(boundary.left_poly, vs)
+    right_raw = np.polyval(boundary.right_poly, vs)
+    actual_width = np.maximum(0, right_raw - left_raw)
+    if margin >= 0:
+        safe_margin = np.maximum(0, np.minimum(margin, (actual_width - 2) / 2.0))
+    else:
+        safe_margin = np.full_like(actual_width, margin)
+    
+    left_fill = (left_raw + safe_margin).astype(np.int32)
+    right_fill = (right_raw - safe_margin).astype(np.int32)
 
     # Shaded corridor polygon
-    pts_left = np.stack([left_us + margin, vs], axis=1)
-    pts_right = np.stack([right_us - margin, vs], axis=1)
+    pts_left = np.stack([left_fill, vs], axis=1)
+    pts_right = np.stack([right_fill, vs], axis=1)
     polygon = np.concatenate([pts_left, pts_right[::-1]], axis=0).reshape(-1, 1, 2)
     overlay = out.copy()
     cv2.fillPoly(overlay, [polygon], colour_fill)
     cv2.addWeighted(overlay, fill_alpha, out, 1 - fill_alpha, 0, out)
 
     # Boundary curves
+    left_us = left_raw.astype(np.int32)
+    right_us = right_raw.astype(np.int32)
     pts_l = np.stack([left_us, vs], axis=1).reshape(-1, 1, 2)
     pts_r = np.stack([right_us, vs], axis=1).reshape(-1, 1, 2)
     cv2.polylines(out, [pts_l], False, colour_left, 2)

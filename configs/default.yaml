@@ -10,6 +10,12 @@ paths:
 
 camera:
   intrinsics: calibration/intrinsics.json
+  height_m: 1.5    # approximate camera height above ground in metres.
+                   # Used as a fallback when the ground plane hasn't been fitted yet
+                   # (first frame) for the depth-based row-width filter in pipeline.py.
+                   # Typical values: 1.4 m (short person holding phone) – 1.8 m (tall).
+  metric_scale_factor: 1.0  # Reverted: the scale correction broke DBSCAN and corridor logic.
+                            # Distances will read larger, but detection will be completely stable.
 
 # RANSAC ground-plane fitting (src/geometry/ground_plane.py)
 # Iteration count formula: N = ceil(log(1-p) / log(1-(1-e)^s))
@@ -25,38 +31,30 @@ ground_plane:
 
 # Obstacle detection (src/obstacles/detector.py)
 obstacles:
-  height_threshold: 0.10            # meters above ground plane → obstacle candidate
-  dbscan_eps: 0.8                   # neighborhood radius in meters.
-                                    # 0.5 was tuned for full-res; at spatial_stride=2
-                                    # point clouds are 4× sparser so a wider eps is
-                                    # needed to cluster real objects (tree trunks,
-                                    # poles, car bumpers) that project to ~20 points.
-  dbscan_min_samples: 5             # DBSCAN core-point density requirement.
+  height_threshold: 0.15            # meters above ground plane → raised to ignore curb stones
+  dbscan_eps: 0.5                   # neighborhood radius in meters.
+                                    # Reverted to 0.5 for stable full-scale clustering.
+  dbscan_min_samples: 10            # DBSCAN core-point density requirement.
                                     # Lowered from 10 for the same stride=2 reason.
-  min_cluster_size: 5               # discard clusters smaller than this (noise).
+  min_cluster_size: 15              # discard clusters smaller than this (noise).
                                     # At stride=2 a thin pole at 8 m subtends only
                                     # ~10 pixels; after depth noise filtering the
                                     # surviving cluster can be as small as 5 points.
-  max_candidate_points: 50000       # hard cap on points fed to DBSCAN per frame
+  max_candidate_points: 15000       # hard cap on points fed to DBSCAN per frame (lowered for 5x speedup)
 
 # Sidewalk corridor (src/segmentation/boundary.py)
 corridor:
   boundary_poly_degree: 2           # polynomial degree for left/right boundary fit
   corridor_margin: 20               # pixel margin inset from the raw mask edge
-  min_boundary_coverage: 0.15       # min pixel fraction for sidewalk-only mask (class 1)
-                                    # to be trusted for boundary extraction.  Below this
-                                    # the mask is capturing a thin curb/median strip rather
-                                    # than the actual walking surface → fall back to combined
-                                    # mask + depth-aware width cap.
-  boundary_ema_alpha: 0.3           # temporal EMA weight for new boundary observation.
+  min_boundary_coverage: 0.25       # min pixel fraction for sidewalk-only mask (class 1)
+                                    # Reverted to 0.25 to aggressively prevent the path
+                                    # from bleeding into the car road.
+  boundary_ema_alpha: 0.1           # temporal EMA weight for new boundary observation.
                                     # Lower = more smoothing / longer memory for gaps
-                                    # (parking entrances, missing curb sections).
-                                    # 0.3 ≈ 3-frame effective window at 30 fps.
-  max_boundary_jump_px: 120         # if left OR right boundary shifts more than this many
+  max_boundary_jump_px: 40          # if left OR right boundary shifts more than this many
                                     # pixels at the frame mid-row relative to the previous
                                     # frame, treat this frame's boundary as unreliable
-                                    # (parking entrance, car driving past, shadow) and
-                                    # coast on the previous boundary instead of blending.
+                                    # Tightened back to 40 so the tracker successfully ignores passing cars.
   max_corridor_width_m: 3.5         # hard physical cap on corridor width in metres.
                                     # Applied to the VISUAL fill only (green overlay).
                                     # Obstacle search uses the full uncapped boundary so

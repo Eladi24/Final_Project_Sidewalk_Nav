@@ -46,15 +46,6 @@ class Pipeline:
         # At stride=2 (960×540) that drops to ~16 MB. RANSAC and DBSCAN produce
         # identical results because their distances are metric (metres), not pixels.
         self._stride = int(config.get("performance", {}).get("spatial_stride", 1))
-        if self._stride > 1:
-            s = float(self._stride)
-            self._intrinsics = {
-                **self._intrinsics,
-                "fx": self._intrinsics["fx"] / s,
-                "fy": self._intrinsics["fy"] / s,
-                "cx": self._intrinsics["cx"] / s,
-                "cy": self._intrinsics["cy"] / s,
-            }
 
         # Grid cache: the (H,W) int32 meshgrids built inside backproject are
         # re-used every frame instead of being allocated and freed per call.
@@ -122,8 +113,25 @@ class Pipeline:
             if boundary_mask is not None:
                 boundary_mask = boundary_mask[::s, ::s]
 
+        # Auto-scale intrinsics based on the runtime resolution.
+        # This perfectly handles converted 540p caches combined with 1080p intrinsics.
+        H, W = depth_m.shape
+        scale_x = W / float(self._intrinsics.get("width", 1920))
+        scale_y = H / float(self._intrinsics.get("height", 1080))
+        runtime_intrinsics = {
+            **self._intrinsics,
+            "fx": self._intrinsics["fx"] * scale_x,
+            "fy": self._intrinsics["fy"] * scale_y,
+            "cx": self._intrinsics["cx"] * scale_x,
+            "cy": self._intrinsics["cy"] * scale_y,
+        }
+        
+        # Apply metric depth scale correction for monocular depth models
+        depth_scale = float(self._cfg.get("camera", {}).get("metric_scale_factor", 1.0))
+        depth_m = depth_m * depth_scale
+
         # Step 1 — back-project to 3-D using the full traversable mask (class 0+1)
-        points, _ = backproject(depth_m, self._intrinsics, mask=mask,
+        points, _ = backproject(depth_m, runtime_intrinsics, mask=mask,
                                 _grid_cache=self._grid_cache)
 
         if len(points) < gp_cfg["ransac_min_inliers"]:
@@ -141,19 +149,32 @@ class Pipeline:
         # Step 3 — extract sidewalk boundary.
         # Prefer the sidewalk-only mask (class 1) for boundaries so the corridor
         # doesn't extend into the car road.  But only use it when it has enough
-        # coverage: < 15 % typically means the model detected a thin curb strip
-        # or raised median rather than the actual walking surface (common on
-        # cobblestone streets classified as road by Cityscapes-trained models).
-        # In that case fall back to the combined mask + depth-aware width cap.
+        # coverage (min_boundary_coverage) AND when the resulting corridor is wide
+        # enough to be meaningful (min_mean_width).  A thin curb-strip boundary
+        # (mean width < 3 × margin) would produce an empty corridor_mask and
+        # 0 search points — the width guard catches that before it causes damage.
+        min_mean_width = 3 * cor_cfg["corridor_margin"]  # px at stride resolution
         boundary: SidewalkBoundary | None = None
         if boundary_mask is not None:
             coverage = float((boundary_mask > 127).mean())
             if coverage >= self._min_boundary_coverage:
-                boundary = extract_boundaries(
-                    boundary_mask, poly_degree=cor_cfg["boundary_poly_degree"]
+                b_cand = extract_boundaries(
+                    boundary_mask,
+                    poly_degree=cor_cfg["boundary_poly_degree"],
                 )
+                if b_cand is not None:
+                    vs_c = b_cand.valid_rows.astype(np.float64)
+                    mean_w = float(np.mean(
+                        np.polyval(b_cand.right_poly, vs_c)
+                        - np.polyval(b_cand.left_poly, vs_c)
+                    ))
+                    if mean_w >= min_mean_width:
+                        boundary = b_cand
         if boundary is None:
-            boundary = extract_boundaries(mask, poly_degree=cor_cfg["boundary_poly_degree"])
+            boundary = extract_boundaries(
+                mask,
+                poly_degree=cor_cfg["boundary_poly_degree"],
+            )
 
         # Temporal EMA smoothing: blend detected boundary with previous frame's.
         # This eliminates jitter and "coasts" across gaps (parking entrances,
@@ -203,9 +224,9 @@ class Pipeline:
         max_width_px: np.ndarray | None = None
         if plane is not None and boundary is not None:
             _, b, c, d = plane
-            fy = self._intrinsics["fy"]
-            fx = self._intrinsics["fx"]
-            cy = self._intrinsics["cy"]
+            fy = runtime_intrinsics["fy"]
+            fx = runtime_intrinsics["fx"]
+            cy = runtime_intrinsics["cy"]
             v_min = max(0, int(boundary.valid_rows.min()))
             v_max = min(depth_m.shape[0] - 1, int(boundary.valid_rows.max()))
             rows_f = np.arange(v_min, v_max + 1, dtype=np.float64)
@@ -249,11 +270,11 @@ class Pipeline:
             if boundary is not None:
                 search_mask = corridor_mask(
                     depth_m.shape, boundary,
-                    margin=cor_cfg["corridor_margin"],
+                    margin=-20, # Reduced to -20px to avoid scanning deep into grass/trees
                 )
             else:
                 search_mask = None
-            all_points, all_pixels = backproject(depth_m, self._intrinsics, mask=search_mask,
+            all_points, all_pixels = backproject(depth_m, runtime_intrinsics, mask=search_mask,
                                                   _grid_cache=self._grid_cache)
             # Pass boundary=None: search_mask already filters points to the corridor
             # so calling points_in_corridor inside detect_obstacles would apply the
@@ -270,6 +291,19 @@ class Pipeline:
                 corridor_margin=cor_cfg["corridor_margin"],
                 max_candidate_points=obs_cfg["max_candidate_points"],
             )
+
+            # Diagnostic: print candidate counts every 50 frames so we can
+            # see exactly where in the pipeline obstacle detection breaks.
+            if frame_index is not None and frame_index % 50 == 0:
+                from src.geometry.ground_plane import point_height_above_plane
+                heights_diag = point_height_above_plane(all_points, plane)
+                n_above = int((heights_diag > obs_cfg["height_threshold"]).sum())
+                print(
+                    f"  [obs diag frame {frame_index:05d}] "
+                    f"search_pts={len(all_points):,}  "
+                    f"above_{obs_cfg['height_threshold']}m={n_above:,}  "
+                    f"obstacles={len(obstacles)}"
+                )
         else:
             obstacles = []
 

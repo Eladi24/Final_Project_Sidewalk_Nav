@@ -81,10 +81,12 @@ def backproject(
             _grid_cache["u"] = u_grid
             _grid_cache["v"] = v_grid
 
-    # Validity: positive depth, and inside mask (if provided)
+    # Validity: positive depth, and inside mask (if provided).
+    # mask may be uint8 (0/255 from PNG) or bool (from corridor_mask) —
+    # use != 0 rather than > 127 so both work correctly.
     valid = depth_m > 0.0
     if mask is not None:
-        valid = valid & (mask > 127)
+        valid = valid & (mask != 0)
 
     u_valid = u_grid[valid].astype(np.float32)   # shape (N,)
     v_valid = v_grid[valid].astype(np.float32)

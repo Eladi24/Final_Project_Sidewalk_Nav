@@ -72,6 +72,11 @@ def render_overlay(
         side = "R" if track.bearing_deg > 0 else "L"
         label = f"{track.distance_m:.1f}m {abs(track.bearing_deg):.0f}deg {side}"
         text_y = max(v_min - 8, 14)
+        
+        # Draw a solid black background behind the text so it is always readable
+        (tw, th), baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2)
+        cv2.rectangle(out, (u_min, text_y - th - 4), (u_min + tw, text_y + baseline), (0, 0, 0), -1)
+        
         cv2.putText(
             out, label, (u_min, text_y),
             cv2.FONT_HERSHEY_SIMPLEX, 0.55, colour, 2, cv2.LINE_AA,
