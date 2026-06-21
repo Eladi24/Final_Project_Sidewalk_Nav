@@ -98,9 +98,7 @@ def main() -> None:
     if args.max_frames:
         indices = indices[: args.max_frames]
 
-    use_sidewalk_masks = has_sidewalk_masks(cache_dir, indices)
     print(f"Processing {len(indices)} frames from {cache_dir} ...")
-    print(f"  Sidewalk-only masks (class 1): {'YES — using for boundary extraction' if use_sidewalk_masks else 'NO — using combined mask + width cap'}")
 
     # Initialise VideoWriter using the first frame's dimensions
     first_frame = cv2.imread(str(cache_dir / f"frame_{indices[0]:05d}.png"))
@@ -128,16 +126,9 @@ def main() -> None:
             print(f"  [WARN] Skipping frame {idx} (missing file).")
             continue
 
-        boundary_mask = None
-        if use_sidewalk_masks:
-            boundary_mask = cv2.imread(
-                str(cache_dir / f"sidewalk_{idx:05d}.png"), cv2.IMREAD_GRAYSCALE
-            )
-
         annotated, tracks = pipeline.process_frame(
             frame, depth, mask,
             frame_index=idx,
-            boundary_mask=boundary_mask,
         )
 
         # If the pipeline ran at reduced resolution, upscale back for the video

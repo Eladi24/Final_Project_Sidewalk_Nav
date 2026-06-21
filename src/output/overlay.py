@@ -21,13 +21,14 @@ from src.obstacles.tracker import Track
 from src.segmentation.boundary import SidewalkBoundary, draw_boundaries
 
 
-# Proximity colour thresholds (metres)
-_DANGER_DIST = 1.5
-_CAUTION_DIST = 3.0
+# Proximity colour thresholds (metres) — in calibrated physical metres.
+# With metric_scale_factor=0.3 applied upstream, these are true real-world distances.
+_DANGER_DIST = 2.0    # anything within 2 m physical → RED
+_CAUTION_DIST = 4.0   # anything within 4 m physical → ORANGE
 
-_COLOUR_DANGER = (0, 0, 220)     # BGR red
-_COLOUR_CAUTION = (0, 200, 255)  # BGR yellow
-_COLOUR_SAFE = (0, 200, 0)       # BGR green
+_COLOUR_DANGER  = (0,   0, 220)   # BGR red
+_COLOUR_CAUTION = (0, 127, 255)   # BGR orange
+_COLOUR_SAFE    = (0, 200,   0)   # BGR green
 
 
 def _obstacle_colour(distance_m: float) -> tuple[int, int, int]:
@@ -38,12 +39,36 @@ def _obstacle_colour(distance_m: float) -> tuple[int, int, int]:
     return _COLOUR_SAFE
 
 
+def _corridor_fill_colour(
+    tracks: list,
+    danger_dist: float = _DANGER_DIST,
+    caution_dist: float = _CAUTION_DIST,
+) -> tuple[int, int, int]:
+    """Return the corridor fill colour based on the nearest obstacle distance.
+
+    Green when clear, orange when an obstacle is within caution range, red when
+    within danger range.  The corridor itself changing colour gives an immediate
+    visual alarm even before the user reads the distance label.
+    """
+    if not tracks:
+        return _COLOUR_SAFE
+    nearest = min(t.distance_m for t in tracks)
+    if nearest < danger_dist:
+        return _COLOUR_DANGER
+    if nearest < caution_dist:
+        return _COLOUR_CAUTION
+    return _COLOUR_SAFE
+
+
 def render_overlay(
     frame: np.ndarray,
     tracks: list[Track],
     boundary: SidewalkBoundary | None = None,
     corridor_margin: int = 20,
     frame_index: int | None = None,
+    max_display_obstacles: int = 8,
+    max_width_px: np.ndarray | None = None,
+    cx_px: float | None = None,
 ) -> np.ndarray:
     """Render the full annotated overlay onto a copy of *frame*.
 
@@ -53,29 +78,53 @@ def render_overlay(
         boundary: fitted SidewalkBoundary, or None to skip corridor drawing.
         corridor_margin: pixel margin for corridor shading.
         frame_index: optional frame number shown in HUD.
+        max_display_obstacles: cap on obstacle boxes drawn; shows the nearest N
+            sorted by distance so the most critical ones are always visible.
+        max_width_px: optional per-row depth-aware width cap array, same length
+            as the row range of *boundary*.  Passed through to draw_boundaries.
+        cx_px: camera principal-point column for the current resolution.
+            Passed through to draw_boundaries to centre the corridor on the
+            camera pointing direction.
 
     Returns:
         Annotated frame copy (uint8 BGR HxWx3).
     """
     out = frame.copy()
 
-    # --- Sidewalk corridor ---
+    # --- Sidewalk corridor (fill colour reacts to nearest obstacle) ---
     if boundary is not None:
-        out = draw_boundaries(out, boundary, margin=corridor_margin)
+        fill_colour = _corridor_fill_colour(tracks)
+        out = draw_boundaries(out, boundary, margin=corridor_margin,
+                              colour_fill=fill_colour,
+                              max_width_px=max_width_px, cx_px=cx_px)
 
-    # --- Obstacle boxes and labels ---
-    for track in tracks:
+    # --- Obstacle boxes and labels (nearest N only) ---
+    display_tracks = sorted(tracks, key=lambda t: t.distance_m)[:max_display_obstacles]
+    for track in display_tracks:
         colour = _obstacle_colour(track.distance_m)
         u_min, v_min, u_max, v_max = track.bbox_px
         cv2.rectangle(out, (u_min, v_min), (u_max, v_max), colour, 2)
 
         side = "R" if track.bearing_deg > 0 else "L"
-        label = f"{track.distance_m:.1f}m {abs(track.bearing_deg):.0f}deg {side}"
-        text_y = max(v_min - 8, 14)
-        
+        # Show forward distance Z and lateral distance X separately.
+        # bearing = arctan2(X, Z), so X = dist*sin(bearing), Z = dist*cos(bearing).
+        bearing_r = np.radians(track.bearing_deg)
+        z_fwd = track.distance_m * np.cos(bearing_r)
+        x_lat = abs(track.distance_m * np.sin(bearing_r))
+        label = f"{z_fwd:.1f}m fwd  {x_lat:.1f}m {side}"
+        text_y = max(v_min - 6, 14)
+
+        # Dark background behind each label so it reads over any colour corridor.
+        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)
+        cv2.rectangle(
+            out,
+            (u_min - 1, text_y - th - 2),
+            (u_min + tw + 2, text_y + 2),
+            (0, 0, 0), cv2.FILLED,
+        )
         cv2.putText(
             out, label, (u_min, text_y),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.55, colour, 2, cv2.LINE_AA,
+            cv2.FONT_HERSHEY_SIMPLEX, 0.5, colour, 2, cv2.LINE_AA,
         )
 
     # --- HUD ---
@@ -83,8 +132,11 @@ def render_overlay(
     if frame_index is not None:
         hud_parts.append(f"frame {frame_index:05d}")
     hud_parts.append(f"{len(tracks)} obstacle(s)")
+    hud_text = "  |  ".join(hud_parts)
+    (hw, hh), _ = cv2.getTextSize(hud_text, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 1)
+    cv2.rectangle(out, (4, 4), (8 + hw + 2, 28 + hh), (0, 0, 0), cv2.FILLED)
     cv2.putText(
-        out, "  |  ".join(hud_parts), (8, 24),
+        out, hud_text, (8, 24),
         cv2.FONT_HERSHEY_SIMPLEX, 0.55, (220, 220, 220), 1, cv2.LINE_AA,
     )
 

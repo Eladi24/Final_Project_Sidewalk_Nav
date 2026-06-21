@@ -11,11 +11,13 @@ paths:
 camera:
   intrinsics: calibration/intrinsics.json
   height_m: 1.5    # approximate camera height above ground in metres.
-                   # Used as a fallback when the ground plane hasn't been fitted yet
-                   # (first frame) for the depth-based row-width filter in pipeline.py.
                    # Typical values: 1.4 m (short person holding phone) – 1.8 m (tall).
-  metric_scale_factor: 1.0  # Reverted: the scale correction broke DBSCAN and corridor logic.
-                            # Distances will read larger, but detection will be completely stable.
+  metric_scale_factor: 0.3  # Depth scale correction for DepthAnythingV2 on this camera.
+                            # The model outputs distances ~3-4x larger than reality on this lens.
+                            # Calibration: stand a known distance D_real (e.g. 2 m) from a flat wall,
+                            # run the pipeline, note the reported distance D_reported, then set
+                            # metric_scale_factor = D_real / D_reported.
+                            # Current value 0.3 derived from: pole at ~1.5 m reported as ~5 m → 1.5/5 = 0.30.
 
 # RANSAC ground-plane fitting (src/geometry/ground_plane.py)
 # Iteration count formula: N = ceil(log(1-p) / log(1-(1-e)^s))
@@ -34,33 +36,53 @@ obstacles:
   height_threshold: 0.15            # meters above ground plane → raised to ignore curb stones
   dbscan_eps: 0.5                   # neighborhood radius in meters.
                                     # Reverted to 0.5 for stable full-scale clustering.
-  dbscan_min_samples: 10            # DBSCAN core-point density requirement.
-                                    # Lowered from 10 for the same stride=2 reason.
-  min_cluster_size: 15              # discard clusters smaller than this (noise).
-                                    # At stride=2 a thin pole at 8 m subtends only
-                                    # ~10 pixels; after depth noise filtering the
-                                    # surviving cluster can be as small as 5 points.
+  dbscan_min_samples: 20            # DBSCAN core-point density requirement.
+                                    # Higher value = noisier environment needs denser
+                                    # cores, reducing spurious micro-clusters from
+                                    # vegetation texture and road markings.
+  min_cluster_size: 20              # discard clusters smaller than this (noise).
+                                    # 20 is the minimum for catching thin tree trunks
+                                    # and utility poles (~30 cm diameter) at 3-8 m while
+                                    # still rejecting single-pixel noise fragments.
   max_candidate_points: 15000       # hard cap on points fed to DBSCAN per frame (lowered for 5x speedup)
+  max_obstacle_distance_m: 12.0     # discard obstacle clusters farther than this.
+                                    # With metric_scale_factor=0.3, physical distances
+                                    # are now calibrated.  Beyond 12 m obstacles are not
+                                    # actionable for a walking pedestrian and far clusters
+                                    # tend to be road-surface / vegetation false positives.
 
 # Sidewalk corridor (src/segmentation/boundary.py)
 corridor:
   boundary_poly_degree: 2           # polynomial degree for left/right boundary fit
   corridor_margin: 20               # pixel margin inset from the raw mask edge
-  min_boundary_coverage: 0.25       # min pixel fraction for sidewalk-only mask (class 1)
-                                    # Reverted to 0.25 to aggressively prevent the path
-                                    # from bleeding into the car road.
-  boundary_ema_alpha: 0.1           # temporal EMA weight for new boundary observation.
-                                    # Lower = more smoothing / longer memory for gaps
-  max_boundary_jump_px: 40          # if left OR right boundary shifts more than this many
+  min_boundary_coverage: 0.05       # min pixel fraction for sidewalk-only mask (class 1)
+                                    # to be used for boundary extraction instead of the
+                                    # combined mask.  Israeli cobblestone sidewalks are
+                                    # misclassified as class 0 (road), so class 1 coverage
+                                    # is typically only 3–8%.  5% lets us use the class-1
+                                    # boundary when it exists, while the left-anchor logic
+                                    # in visual_boundary handles the remaining cases.
+  boundary_ema_alpha: 0.2           # temporal EMA weight for new boundary observation.
+                                    # 0.2 ≈ 5-frame effective window.  Raised from 0.1
+                                    # so the corridor adapts faster to sidewalk curves
+                                    # while still suppressing single-frame jitter.
+  max_boundary_jump_px: 60          # if left OR right boundary shifts more than this many
                                     # pixels at the frame mid-row relative to the previous
-                                    # frame, treat this frame's boundary as unreliable
-                                    # Tightened back to 40 so the tracker successfully ignores passing cars.
-  max_corridor_width_m: 3.5         # hard physical cap on corridor width in metres.
-                                    # Applied to the VISUAL fill only (green overlay).
-                                    # Obstacle search uses the full uncapped boundary so
-                                    # parked cars and poles at the sidewalk edge are caught.
-                                    # Standard Israeli sidewalk: 1.5 – 3 m; 3.5 m leaves
-                                    # headroom for wider paths across 13 videos.
+                                    # frame, treat this frame's boundary as unreliable.
+                                    # Raised from 40 so legitimate curve transitions on
+                                    # a winding sidewalk are not rejected as transients.
+  max_corridor_width_m: 3.0         # physical cap on corridor width in metres.
+                                    # Applied at render and search time via max_width_px
+                                    # = max_corridor_width_m × fx / max(Z_row, z_floor_m).
+                                    # Israeli sidewalks range from 1.5 m (narrow) to 4 m
+                                    # (wide boulevard).  3.0 m covers most while keeping
+                                    # the corridor off a typical 6 m road lane.
+  z_floor_m: 5.0                    # minimum ground-plane depth (metres) used when
+                                    # computing max_width_px per row.  Without this floor,
+                                    # at near rows where Z_row ≈ 1.5 m the cap becomes
+                                    # 2.5 × fx / 1.5 ≈ 1300 px > image width = inactive.
+                                    # With z_floor = 5 m: max_width_px ≤ 2.5×780/5 = 390 px
+                                    # at all rows → corridor bounded to ≤ 2.5 m always.
 
 # Temporal tracking (src/obstacles/tracker.py)
 tracking:
@@ -80,6 +102,12 @@ segmentation:
   # Include class 0 (road) because cobblestone/brick sidewalks are often
   # misclassified as road by a model trained on smooth European pavement.
   traversable_class_ids: [0, 1]
+
+# Output / overlay rendering (src/output/overlay.py)
+output:
+  max_display_obstacles: 5    # show only the N nearest obstacles on screen.
+                              # Capped at 5 to prevent label overlap.  The 5
+                              # nearest obstacles are always the most actionable.
 
 # Performance — memory reduction for Stage B on low-RAM machines
 performance:

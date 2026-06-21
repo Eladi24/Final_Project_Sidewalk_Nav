@@ -19,11 +19,12 @@ import json
 import numpy as np
 
 from src.geometry.backprojection import backproject
-from src.geometry.ground_plane import fit_ground_plane
+from src.geometry.ground_plane import fit_ground_plane, point_height_above_plane
 from src.obstacles.detector import detect_obstacles
 from src.obstacles.tracker import ObstacleTracker, Track
 from src.output.overlay import render_overlay
 from src.segmentation.boundary import SidewalkBoundary, corridor_mask, extract_boundaries
+
 
 
 class Pipeline:
@@ -130,9 +131,10 @@ class Pipeline:
         depth_scale = float(self._cfg.get("camera", {}).get("metric_scale_factor", 1.0))
         depth_m = depth_m * depth_scale
 
-        # Step 1 — back-project to 3-D using the full traversable mask (class 0+1)
-        points, _ = backproject(depth_m, runtime_intrinsics, mask=mask,
-                                _grid_cache=self._grid_cache)
+        # Step 1 — back-project to 3-D using the full traversable mask (class 0+1).
+        # Keep ground_pixels for height-based boundary filtering in Step 3.
+        points, ground_pixels = backproject(depth_m, runtime_intrinsics, mask=mask,
+                                            _grid_cache=self._grid_cache)
 
         if len(points) < gp_cfg["ransac_min_inliers"]:
             return frame.copy(), []
@@ -146,35 +148,38 @@ class Pipeline:
             max_input_points=gp_cfg.get("ransac_max_input_points", 15000),
         )
 
-        # Step 3 — extract sidewalk boundary.
-        # Prefer the sidewalk-only mask (class 1) for boundaries so the corridor
-        # doesn't extend into the car road.  But only use it when it has enough
-        # coverage (min_boundary_coverage) AND when the resulting corridor is wide
-        # enough to be meaningful (min_mean_width).  A thin curb-strip boundary
-        # (mean width < 3 × margin) would produce an empty corridor_mask and
-        # 0 search points — the width guard catches that before it causes damage.
-        min_mean_width = 3 * cor_cfg["corridor_margin"]  # px at stride resolution
-        boundary: SidewalkBoundary | None = None
-        if boundary_mask is not None:
-            coverage = float((boundary_mask > 127).mean())
-            if coverage >= self._min_boundary_coverage:
-                b_cand = extract_boundaries(
-                    boundary_mask,
-                    poly_degree=cor_cfg["boundary_poly_degree"],
-                )
-                if b_cand is not None:
-                    vs_c = b_cand.valid_rows.astype(np.float64)
-                    mean_w = float(np.mean(
-                        np.polyval(b_cand.right_poly, vs_c)
-                        - np.polyval(b_cand.left_poly, vs_c)
-                    ))
-                    if mean_w >= min_mean_width:
-                        boundary = b_cand
-        if boundary is None:
-            boundary = extract_boundaries(
-                mask,
-                poly_degree=cor_cfg["boundary_poly_degree"],
-            )
+        # Step 3 — extract sidewalk boundaries using height-above-plane filtering.
+        #
+        # SegFormer labels both the brick sidewalk and the asphalt road as class-0
+        # ("road") and also labels the thin concrete curb between them the same way,
+        # so there is no gap in the mask to separate them via connected components.
+        # The right boundary polynomial then fits to the road's far edge.
+        #
+        # Fix: the RANSAC ground plane (fitted with a 5 cm inlier threshold) is
+        # already the BRICK surface — road pixels at ~15 cm below are 3× outside
+        # the inlier band and are treated as outliers by RANSAC.  We reuse the 3-D
+        # points from Step 1 to compute each pixel's signed height above the brick
+        # plane and rebuild the boundary mask from only those pixels within 10 cm
+        # of that plane.  Road pixels (−15 cm) are excluded; brick (~0 cm) and
+        # above-ground vegetation (>0 cm) are kept.
+        #
+        # Falls back to the full combined mask when no plane was fitted yet
+        # (first frame or too few inliers).
+        if plane is not None and len(points) > 0:
+            heights = point_height_above_plane(points, plane)
+            near_ground = heights > -0.10   # keep brick (≈0 cm), drop road (≈−15 cm)
+            mask_for_boundary = np.zeros_like(mask)
+            good_pix = ground_pixels[near_ground]  # (u=col, v=row) per backproject contract
+            if len(good_pix) > 0:
+                mask_for_boundary[good_pix[:, 1], good_pix[:, 0]] = 255
+        else:
+            mask_for_boundary = mask
+
+        boundary: SidewalkBoundary | None = extract_boundaries(
+            mask_for_boundary,
+            poly_degree=cor_cfg["boundary_poly_degree"],
+            cx=int(runtime_intrinsics["cx"]),
+        )
 
         # Temporal EMA smoothing: blend detected boundary with previous frame's.
         # This eliminates jitter and "coasts" across gaps (parking entrances,
@@ -215,12 +220,26 @@ class Pipeline:
             # No boundary this frame — coast on the last known good one
             boundary = self._prev_boundary
 
-        # Step 4 — depth-aware corridor width cap.
-        # For each image row, compute max corridor width in pixels from the
-        # camera intrinsics and the ground-plane depth at that row.  This caps
-        # the right boundary so it cannot exceed left + max_width metres,
-        # preventing the corridor from spanning the full car road even when the
-        # combined traversable mask (class 0+1) is very wide.
+        # Step 4 — depth-aware corridor width cap (per-row, applied at render time).
+        #
+        # For each image row, derive the ground-plane depth Z_row and compute
+        # max_width_px = max_corridor_width_m * fx / Z_row.
+        #
+        # Key design choice — Z_floor_m (configurable, default 5 m):
+        #   Z_row is clipped to [Z_floor_m, 50 m] instead of [1 m, 50 m].
+        #   At Z_row = 1.5 m (near rows), the uncapped width is 2.5*780/1.5 = 1300 px,
+        #   which exceeds the image width and the cap becomes inactive — the corridor
+        #   then spans the full car road at the bottom of the frame.
+        #   Clipping Z_row to 5 m gives max_width_px = 2.5*780/5 = 390 px at ALL rows,
+        #   so the cap is always active.  Physically this bounds the displayed corridor
+        #   to 2.5 m regardless of how close to the camera that row is.
+        #
+        # IMPORTANT: this cap is applied at RENDER and SEARCH time via the
+        # max_width_px parameter of draw_boundaries() and corridor_mask().
+        # We do NOT refit polynomial coefficients to the capped data — refitting
+        # a degree-2 polynomial to partially-collapsed data causes extrapolation
+        # overshoot that makes boundaries cross each other at extreme rows.
+        z_floor_m = float(cor_cfg.get("z_floor_m", 5.0))
         max_width_px: np.ndarray | None = None
         if plane is not None and boundary is not None:
             _, b, c, d = plane
@@ -234,68 +253,54 @@ class Pipeline:
             #   plane eq on camera ray → Z = -d / (b*(v-cy)/fy + c)
             denom = b * (rows_f - cy) / fy + c
             Z_row = np.where(np.abs(denom) > 1e-6, -d / denom, 50.0)
-            Z_row = np.clip(Z_row, 1.0, 50.0)
+            Z_row = np.clip(Z_row, z_floor_m, 50.0)   # floor = 5 m so cap is always active
             max_width_px = self._max_corridor_width_m * fx / Z_row
 
-        # Step 5 — build capped visual boundary for rendering.
-        # The EMA boundary polynomials are uncapped (wide).  Re-fit the right
-        # polynomial to the capped values so the green fill matches exactly the
-        # area that is actually searched for obstacles — otherwise the user sees
-        # the corridor extending into the road/median while the detection happens
-        # only on the narrower sidewalk.
-        visual_boundary = boundary
-        if max_width_px is not None and boundary is not None:
-            v_min_vis = max(0, int(boundary.valid_rows.min()))
-            v_max_vis = min(depth_m.shape[0] - 1, int(boundary.valid_rows.max()))
-            rows_vis  = np.arange(v_min_vis, v_max_vis + 1, dtype=np.float64)
-            left_vis  = np.polyval(boundary.left_poly,  rows_vis)
-            right_vis = np.polyval(boundary.right_poly, rows_vis)
-            right_vis_capped = np.minimum(right_vis, left_vis + max_width_px)
-            right_poly_capped = np.polyfit(rows_vis, right_vis_capped, boundary.poly_degree)
-            visual_boundary = SidewalkBoundary(
-                left_poly=boundary.left_poly,
-                right_poly=right_poly_capped,
-                valid_rows=boundary.valid_rows,
-                poly_degree=boundary.poly_degree,
-            )
+        # Step 5 — no polynomial refitting.
+        #
+        # The depth-aware cap (max_width_px) is applied at render and search time
+        # directly inside draw_boundaries() and corridor_mask() via their
+        # max_width_px parameter.  Do NOT refit polynomial coefficients to capped
+        # column data: a degree-2 polynomial fitted to partially-collapsed values
+        # (right = left at rows where the raw right is inside the cap) can
+        # extrapolate wildly outside the fitted domain, causing the right and left
+        # boundary lines to cross each other at near rows (visible as the green
+        # corridor collapsing to zero width or the magenta line diving left).
+        visual_boundary = boundary  # same polynomial; cap applied at draw time
 
         # Step 6 — detect obstacle candidates.
-        # IMPORTANT: use the UNCAPPED boundary for the search area, not visual_boundary.
-        # The visual_boundary is clipped to max_corridor_width_m to keep the green fill
-        # off the car road — but that clip also excludes edge obstacles (parked cars,
-        # utility poles at the sidewalk/road boundary).  The wider uncapped boundary
-        # includes those objects.  The height threshold filters out flat ground anyway,
-        # so the extra area does not cause ground-surface false positives.
+        # The corridor_mask is generated from the EMA boundary + depth-aware cap,
+        # so the search area matches the displayed green corridor exactly.
+        # Obstacles detected outside the green corridor (on the car road) are
+        # excluded without needing a separate uncapped boundary.
+        cx_px = runtime_intrinsics["cx"]
         if plane is not None:
             if boundary is not None:
                 search_mask = corridor_mask(
                     depth_m.shape, boundary,
-                    margin=-20, # Reduced to -20px to avoid scanning deep into grass/trees
+                    margin=10,
+                    max_width_px=max_width_px,
+                    cx_px=cx_px,   # centre on camera direction, not mask edges
                 )
             else:
                 search_mask = None
             all_points, all_pixels = backproject(depth_m, runtime_intrinsics, mask=search_mask,
                                                   _grid_cache=self._grid_cache)
-            # Pass boundary=None: search_mask already filters points to the corridor
-            # so calling points_in_corridor inside detect_obstacles would apply the
-            # margin a second time and silently discard obstacles near the walls.
             obstacles = detect_obstacles(
                 all_points,
                 all_pixels,
                 plane,
-                boundary=None,
+                boundary=None,        # search_mask already filters; no double-margin
                 height_threshold=obs_cfg["height_threshold"],
                 dbscan_eps=obs_cfg["dbscan_eps"],
                 dbscan_min_samples=obs_cfg["dbscan_min_samples"],
                 min_cluster_size=obs_cfg["min_cluster_size"],
                 corridor_margin=cor_cfg["corridor_margin"],
                 max_candidate_points=obs_cfg["max_candidate_points"],
+                max_obstacle_distance_m=float(obs_cfg.get("max_obstacle_distance_m", 25.0)),
             )
 
-            # Diagnostic: print candidate counts every 50 frames so we can
-            # see exactly where in the pipeline obstacle detection breaks.
             if frame_index is not None and frame_index % 50 == 0:
-                from src.geometry.ground_plane import point_height_above_plane
                 heights_diag = point_height_above_plane(all_points, plane)
                 n_above = int((heights_diag > obs_cfg["height_threshold"]).sum())
                 print(
@@ -310,7 +315,6 @@ class Pipeline:
         # Step 7 — update tracker
         active_tracks = self._tracker.update(obstacles)
 
-        # Attach bbox from the matching obstacle to each track (best effort)
         for track in active_tracks:
             if not hasattr(track, "bbox_px"):
                 matched = min(
@@ -323,13 +327,19 @@ class Pipeline:
                 else:
                     track.bbox_px = (0, 0, 1, 1)  # type: ignore[attr-defined]
 
-        # Step 8 — render overlay using the CAPPED visual boundary
+        # Step 8 — render overlay.
+        # Pass max_width_px so draw_boundaries() clamps the right boundary line and
+        # fill to the same cap as the obstacle search area.
+        out_cfg = self._cfg.get("output", {})
         annotated = render_overlay(
             frame,
             active_tracks,
             boundary=visual_boundary,
             corridor_margin=cor_cfg["corridor_margin"],
             frame_index=frame_index,
+            max_display_obstacles=int(out_cfg.get("max_display_obstacles", 8)),
+            max_width_px=max_width_px,
+            cx_px=cx_px,
         )
 
         return annotated, active_tracks

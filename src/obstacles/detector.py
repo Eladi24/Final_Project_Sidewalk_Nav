@@ -67,6 +67,7 @@ def detect_obstacles(
     min_cluster_size: int = 15,
     corridor_margin: int = 20,
     max_candidate_points: int = 50_000,
+    max_obstacle_distance_m: float = 25.0,
 ) -> list[Obstacle]:
     """Detect obstacles in a single frame's point cloud.
 
@@ -139,9 +140,18 @@ def detect_obstacles(
         cluster_pix = cand_pixels[mask]   # (K, 2)
 
         centroid = cluster_pts.mean(axis=0).astype(np.float32)
-        X, Y, Z = centroid
-        distance_m = float(np.sqrt(X ** 2 + Z ** 2))
-        bearing_deg = float(np.degrees(np.arctan2(X, Z)))
+
+        # Report distance/bearing to the NEAREST point of the cluster, not the
+        # centroid.  When a cluster mixes obstacle surface pixels (near) with
+        # background pixels that bled through the depth map (far), the centroid
+        # is pulled toward the background, giving a wildly large reported distance.
+        # The nearest point is what a pedestrian would physically encounter.
+        # centroid_m is kept for the EMA tracker (needs a stable 3-D anchor).
+        horiz_dists = np.sqrt(cluster_pts[:, 0] ** 2 + cluster_pts[:, 2] ** 2)
+        near_idx = int(np.argmin(horiz_dists))
+        X_near, _, Z_near = cluster_pts[near_idx]
+        distance_m = float(horiz_dists[near_idx])
+        bearing_deg = float(np.degrees(np.arctan2(X_near, Z_near)))
 
         u_min = int(cluster_pix[:, 0].min())
         v_min = int(cluster_pix[:, 1].min())
@@ -156,6 +166,7 @@ def detect_obstacles(
             cluster_id=int(cluster_id),
         ))
 
+    obstacles = [o for o in obstacles if o.distance_m <= max_obstacle_distance_m]
     obstacles.sort(key=lambda o: o.distance_m)
     return obstacles
 
