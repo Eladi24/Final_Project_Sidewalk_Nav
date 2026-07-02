@@ -83,7 +83,10 @@ corridor:
                                     # 2.5 × fx / 1.5 ≈ 1300 px > image width = inactive.
                                     # With z_floor = 5 m: max_width_px ≤ 2.5×780/5 = 390 px
                                     # at all rows → corridor bounded to ≤ 2.5 m always.
-  min_corridor_width_px: 10         # minimum corridor width in pixels to prevent path collapse.
+  min_corridor_width_px: 40         # minimum corridor width in pixels to prevent path collapse.
+                                    # 40 px at stride=2 (≈80 px at 1080p) prevents the corridor
+                                    # from visually collapsing to a line regardless of what the
+                                    # polynomials do in the far-field.
 
 # Temporal tracking (src/obstacles/tracker.py)
 tracking:
@@ -96,13 +99,25 @@ depth:
   model_name: "depth-anything/Depth-Anything-V2-Metric-Outdoor-Small-hf"
   input_resolution: [518, 518]      # model's expected input (H, W)
 
-# Stage A — SegFormer (src/segmentation/sidewalk_seg.py)
+# Stage A — Sidewalk segmentation (src/segmentation/sidewalk_seg.py)
+# Backend is auto-detected from model_name ("mask2former" → Mask2Former, else SegFormer).
+# Class IDs are auto-discovered from the model's id2label config when using Mask2Former.
+#
+# Option A — SegFormer on Cityscapes (current default):
+#   model_name: "nvidia/segformer-b2-finetuned-cityscapes-1024-1024"
+#   Include class 0 (road) because Israeli cobblestone is misclassified as road.
+#
+# Option B — Mask2Former on Mapillary Vistas (try for cobblestone clips):
+#   model_name: "facebook/mask2former-swin-tiny-mapillary-vistas-semantic"
+#   Class IDs are auto-discovered — no need to set traversable_class_ids.
+#   Run a single-frame test before regenerating a full cache:
+#     python src/segmentation/sidewalk_seg.py frame_00000.png \
+#         --model facebook/mask2former-swin-tiny-mapillary-vistas-semantic \
+#         --out test_overlay.png
+#   Bright green = sidewalk-only, dark green = combined traversable.
 segmentation:
   model_name: "nvidia/segformer-b2-finetuned-cityscapes-1024-1024"
-  # Cityscapes classes: 0=road, 1=sidewalk, 2=building, 3=wall, 4=fence ...
-  # Include class 0 (road) because cobblestone/brick sidewalks are often
-  # misclassified as road by a model trained on smooth European pavement.
-  traversable_class_ids: [0, 1]
+  traversable_class_ids: [0, 1]   # Cityscapes: 0=road, 1=sidewalk
 
 # Output / overlay rendering (src/output/overlay.py)
 output:

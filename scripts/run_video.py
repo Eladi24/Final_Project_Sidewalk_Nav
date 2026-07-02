@@ -126,9 +126,19 @@ def main() -> None:
             print(f"  [WARN] Skipping frame {idx} (missing file).")
             continue
 
+        # Load the sidewalk-only (class-1) mask cached by Stage A.
+        # This excludes road pixels so the boundary extraction step can
+        # separate the user's sidewalk from remote ones across the road.
+        sidewalk_path = cache_dir / f"sidewalk_{idx:05d}.png"
+        boundary_mask = (
+            cv2.imread(str(sidewalk_path), cv2.IMREAD_GRAYSCALE)
+            if sidewalk_path.exists() else None
+        )
+
         annotated, tracks = pipeline.process_frame(
             frame, depth, mask,
             frame_index=idx,
+            boundary_mask=boundary_mask,
         )
 
         # If the pipeline ran at reduced resolution, upscale back for the video

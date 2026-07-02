@@ -69,39 +69,49 @@ def extract_boundaries(
     H = mask.shape[0]
 
     # --- Connected-component isolation ---
-    # The mask can contain multiple disconnected regions (e.g., the sidewalk
-    # you are on, and another one across the street). We must isolate the
-    # component directly in front of the camera. We do this by finding the
-    # largest connected component in the bottom part of the image.
+    # Seed from the bottom-center strip of the frame — the surface the user
+    # is standing on. This correctly isolates the user's sidewalk even when
+    # road pixels (class 0) create a connected bridge to a far parallel
+    # sidewalk or roundabout, which would otherwise make both sidewalks
+    # appear as one large component and pull the boundary across the road.
     if cx is not None:
         try:
-            # Use OpenCV's connectedComponents which is already a dependency.
-            # This avoids adding a new scipy dependency.
             import cv2
-            
+
             num_labels, labeled, stats, centroids = cv2.connectedComponentsWithStats(
                 binary.astype(np.uint8), connectivity=8
             )
-            
+
             if num_labels > 1:
-                # Consider components in the bottom 40% of the image
-                bottom_half_start = int(H * 0.6)
-                
-                # Find the largest component that appears in the bottom half
-                candidate_labels = np.unique(labeled[bottom_half_start:])
-                if len(candidate_labels) > 1: # more than just background
-                    # Exclude background label 0
+                selected_label = 0
+                W = binary.shape[1]
+
+                # Primary: find the most common component label in the bottom
+                # 15 % of rows within ±W/8 columns of the principal point.
+                # The bottom-center pixel is always on the user's own sidewalk.
+                col_lo = max(0, cx - W // 8)
+                col_hi = min(W, cx + W // 8)
+                bottom_strip = labeled[int(H * 0.85):, col_lo:col_hi]
+                nonzero = bottom_strip[bottom_strip != 0]
+                if len(nonzero) > 0:
+                    selected_label = int(np.bincount(nonzero).argmax())
+
+                # Fallback: no mask pixels at bottom-center (e.g. the user is
+                # at an intersection with no visible sidewalk directly ahead).
+                # Use the largest component in the bottom 40 % of the frame.
+                if selected_label == 0:
+                    bottom_start = int(H * 0.6)
+                    candidate_labels = np.unique(labeled[bottom_start:])
                     candidate_labels = candidate_labels[candidate_labels != 0]
-                    
-                    # Get areas of these components
-                    areas = stats[candidate_labels, cv2.CC_STAT_AREA]
-                    
-                    # Select the largest one
-                    largest_label = candidate_labels[np.argmax(areas)]
-                    binary = (labeled == largest_label)
+                    if len(candidate_labels) > 0:
+                        areas = stats[candidate_labels, cv2.CC_STAT_AREA]
+                        selected_label = int(candidate_labels[np.argmax(areas)])
+
+                if selected_label != 0:
+                    binary = (labeled == selected_label)
 
         except ImportError:
-            pass # Fallback to using the full mask if cv2 is not available
+            pass
 
     left_us: list[int] = []
     right_us: list[int] = []
@@ -112,8 +122,10 @@ def extract_boundaries(
         cols = np.where(row)[0]
         if len(cols) < min_row_width:
             continue
-        left_us.append(int(cols[0]))
-        right_us.append(int(cols[-1]))
+        # 5th/95th percentile instead of raw min/max — rejects isolated stray
+        # pixels that would otherwise pull the polynomial toward walls or road.
+        left_us.append(int(np.percentile(cols, 5)))
+        right_us.append(int(np.percentile(cols, 95)))
         valid_rows.append(v)
 
     if len(valid_rows) < poly_degree + 1:
@@ -123,20 +135,21 @@ def extract_boundaries(
     lu = np.array(left_us, dtype=np.float64)
     ru = np.array(right_us, dtype=np.float64)
 
-    # LEFT boundary: fit all valid rows. The left edge (wall / vegetation) is
-    # usually reliable.
-    left_poly = np.polyfit(vs, lu, poly_degree)
-
-    # RIGHT boundary: fit only NEAR rows (bottom half of frame).
-    # Far rows often include road pixels in the combined mask, pulling the
-    # right boundary rightward. Fitting only near rows and extrapolating
-    # avoids this contamination.
-    near_row_cutoff = float(H) * 0.5   # rows at or below 50% from top
+    # Fit BOTH boundaries on the bottom half of the frame (near-field rows).
+    # Fitting only left on all rows while right uses bottom-half caused the
+    # two polynomials to have different curvatures and converge at the top,
+    # producing a "pointy" corridor tip in the far field. Using the same
+    # fitting domain makes them symmetric so the corridor narrows smoothly
+    # and uniformly rather than pinching to a point.
+    near_row_cutoff = float(H) * 0.5
     near_mask = vs >= near_row_cutoff
     if near_mask.sum() >= poly_degree + 1:
+        left_poly  = np.polyfit(vs[near_mask], lu[near_mask], poly_degree)
         right_poly = np.polyfit(vs[near_mask], ru[near_mask], poly_degree)
     else:
-        right_poly = np.polyfit(vs, ru, poly_degree)   # fallback if not enough near points
+        # Not enough near rows — fall back to all available rows.
+        left_poly  = np.polyfit(vs, lu, poly_degree)
+        right_poly = np.polyfit(vs, ru, poly_degree)
 
     return SidewalkBoundary(
         left_poly=left_poly,

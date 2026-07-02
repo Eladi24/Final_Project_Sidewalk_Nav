@@ -109,10 +109,11 @@ def run_inference(
         # combined binary mask, so we can also save a sidewalk-only mask (class 1)
         # without running the model twice.
         mask, class_map = seg.segment(rgb_frame, return_class_map=True)
-        # class 1 = Cityscapes "sidewalk" — the true pedestrian surface boundary.
+        # sidewalk_only_class_id is auto-discovered from the model's id2label
+        # config (class 1 for Cityscapes, auto-detected for Mapillary / others).
         # Stage B uses this narrower mask for corridor boundary extraction so the
-        # walkable corridor doesn't bleed into the car road (class 0).
-        sidewalk_mask = (class_map == 1).astype(np.uint8) * 255
+        # walkable corridor doesn't bleed into the car road.
+        sidewalk_mask = (class_map == seg.sidewalk_only_class_id).astype(np.uint8) * 255
 
         # --- Write outputs ---
         cv2.imwrite(str(out_dir / f"frame_{frame_idx:05d}.png"), bgr_frame)

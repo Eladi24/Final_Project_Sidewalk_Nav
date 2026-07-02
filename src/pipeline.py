@@ -196,22 +196,59 @@ class Pipeline:
         # (first frame or too few inliers).
         if plane is not None and len(points) > 0:
             heights = point_height_above_plane(points, plane)
-            near_ground = np.abs(heights) < 0.10   # keep points within +/- 10cm of the plane
+            near_ground = (heights > -0.05) & (heights < 0.15)
             mask_for_boundary = np.zeros_like(mask)
-            good_pix = ground_pixels[near_ground]  # (u=col, v=row) per backproject contract
-            if len(good_pix) > 0: 
-                mask_for_boundary[good_pix[:, 1], good_pix[:, 0]] = 255
+
+            # Prefer class-1 (sidewalk-only) pixels for boundary extraction.
+            #
+            # WHY: class-0 (road) pixels in the combined mask create a
+            # contiguous bridge between the user's sidewalk and any remote
+            # sidewalk across the road (roundabout, parallel path). When
+            # they are all one connected component, bottom-center seeding
+            # cannot isolate the near sidewalk. Class-1 excludes road, so
+            # the near and far sidewalks are separate components, and
+            # bottom-center seeding works correctly.
+            #
+            # FALLBACK: if class-1 coverage is below 50 pixels (Israeli
+            # cobblestone is often entirely misclassified as class-0), fall
+            # back to the height-filtered combined mask, which at least
+            # rejects road pixels that are >5 cm below the sidewalk plane.
+            using_class1 = False
+            class1_ratio = 0.0
+            if boundary_mask is not None:
+                in_class1 = boundary_mask[ground_pixels[:, 1], ground_pixels[:, 0]] != 0
+                class1_near = near_ground & in_class1
+                combined_count = max(1, int(near_ground.sum()))
+                class1_count = int(class1_near.sum())
+                class1_ratio = class1_count / combined_count
+                # Require class-1 to cover at least 8 % of the combined mask.
+                # Below that it is capturing only thin curb strips, not the
+                # walking surface itself, and the resulting boundary would be
+                # far too small to be useful. Fall back to the height-filtered
+                # combined mask in that case.
+                if class1_count >= 50 and class1_ratio >= 0.08:
+                    good_pix = ground_pixels[class1_near]
+                    mask_for_boundary[good_pix[:, 1], good_pix[:, 0]] = 255
+                    using_class1 = True
+
+            if not using_class1:
+                good_pix = ground_pixels[near_ground]
+                if len(good_pix) > 0:
+                    mask_for_boundary[good_pix[:, 1], good_pix[:, 0]] = 255
 
             if frame_index is not None and frame_index % 30 == 0:
                 n_kept = int(near_ground.sum())
                 n_total = len(heights)
                 h_p10 = float(np.percentile(heights, 10))
                 h_p90 = float(np.percentile(heights, 90))
+                src = (f"class-1 ({class1_ratio*100:.0f}%)"
+                       if using_class1
+                       else f"combined (class-1={class1_ratio*100:.1f}%)")
                 print(
                     f"  [height diag frame {frame_index:05d}] "
                     f"kept={n_kept}/{n_total} ({100*n_kept//max(1,n_total)} %)  "
                     f"height p10={h_p10:.2f}m p90={h_p90:.2f}m  "
-                    f"(brick≈0 m, road≈−0.15 m)"
+                    f"boundary_src={src}"
                 )
         else:
             mask_for_boundary = mask
@@ -221,6 +258,22 @@ class Pipeline:
             poly_degree=cor_cfg["boundary_poly_degree"],
             cx=int(runtime_intrinsics["cx"]),
         )
+
+        # Far-field direction check: the corridor centre at the topmost fitted
+        # row should be close to cx (the camera's forward direction). If it
+        # drifts more than 35 % of frame width away from cx, the corridor is
+        # pointing toward a roundabout or parallel sidewalk across the road,
+        # not the actual walking path. Coast on the previous boundary instead.
+        # Only active when a previous boundary exists so we have something to
+        # fall back to (the first frame is always accepted as-is).
+        if boundary is not None and self._prev_boundary is not None:
+            far_row   = float(boundary.valid_rows.min())
+            far_left  = np.polyval(boundary.left_poly,  far_row)
+            far_right = np.polyval(boundary.right_poly, far_row)
+            far_center = (far_left + far_right) / 2.0
+            cx_f = float(runtime_intrinsics["cx"])
+            if abs(far_center - cx_f) > W * 0.35:
+                boundary = self._prev_boundary  # corridor aimed wrong direction
 
         # Temporal EMA smoothing: blend detected boundary with previous frame's.
         # This eliminates jitter and "coasts" across gaps (parking entrances,
