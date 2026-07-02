@@ -62,21 +62,20 @@ def run_inference(
     from src.depth.depth_estimator import DepthEstimator
     from src.segmentation.sidewalk_seg import SidewalkSegmenter
 
-    if traversable_class_ids is None:
-        traversable_class_ids = [0, 1]
-
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"Loading models on {device} ...")
-    print(f"Traversable classes: {traversable_class_ids} "
-          f"({', '.join(['road' if c==0 else 'sidewalk' if c==1 else str(c) for c in traversable_class_ids])})")
     depth_est = DepthEstimator(model_name=depth_model, device=device)
+    # Pass traversable_class_ids=None to trigger auto-discovery from the model's
+    # id2label config. This is required for non-Cityscapes models (e.g. Mapillary)
+    # where class 0 and 1 are not road and sidewalk.
     seg = SidewalkSegmenter(
         model_name=seg_model,
-        traversable_class_ids=traversable_class_ids,
+        traversable_class_ids=traversable_class_ids,  # None = auto-discover
         device=device,
     )
+    print(f"Traversable classes: {seg.traversable_class_ids}")
 
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
@@ -147,8 +146,10 @@ if __name__ == "__main__":
         default="nvidia/segformer-b2-finetuned-cityscapes-1024-1024",
     )
     parser.add_argument(
-        "--traversable-classes", type=int, nargs="+", default=[0, 1],
-        help="Cityscapes class IDs to treat as walkable (default: 0 1 = road+sidewalk)"
+        "--traversable-classes", type=int, nargs="+", default=None,
+        help="Class IDs to treat as walkable. Omit to auto-discover from the model's "
+             "label config (recommended for non-Cityscapes models like Mapillary). "
+             "For SegFormer Cityscapes pass: --traversable-classes 0 1"
     )
     parser.add_argument("--device", default="cuda",
                         help="'cuda' (recommended on Colab) or 'cpu'")
