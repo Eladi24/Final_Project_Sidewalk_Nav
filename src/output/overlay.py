@@ -69,6 +69,7 @@ def render_overlay(
     max_display_obstacles: int = 8,
     max_width_px: np.ndarray | None = None,
     cx_px: float | None = None,
+    min_width_px: int = 10,
 ) -> np.ndarray:
     """Render the full annotated overlay onto a copy of *frame*.
 
@@ -85,6 +86,8 @@ def render_overlay(
         cx_px: camera principal-point column for the current resolution.
             Passed through to draw_boundaries to centre the corridor on the
             camera pointing direction.
+        min_width_px: minimum corridor width in pixels. Passed through to
+            draw_boundaries.
 
     Returns:
         Annotated frame copy (uint8 BGR HxWx3).
@@ -96,7 +99,8 @@ def render_overlay(
         fill_colour = _corridor_fill_colour(tracks)
         out = draw_boundaries(out, boundary, margin=corridor_margin,
                               colour_fill=fill_colour,
-                              max_width_px=max_width_px, cx_px=cx_px)
+                              max_width_px=max_width_px, cx_px=cx_px,
+                              min_width_px=min_width_px)
 
     # --- Obstacle boxes and labels (nearest N only) ---
     display_tracks = sorted(tracks, key=lambda t: t.distance_m)[:max_display_obstacles]

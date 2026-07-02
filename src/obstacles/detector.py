@@ -141,16 +141,16 @@ def detect_obstacles(
 
         centroid = cluster_pts.mean(axis=0).astype(np.float32)
 
-        # Report distance/bearing to the NEAREST point of the cluster, not the
-        # centroid.  When a cluster mixes obstacle surface pixels (near) with
-        # background pixels that bled through the depth map (far), the centroid
-        # is pulled toward the background, giving a wildly large reported distance.
-        # The nearest point is what a pedestrian would physically encounter.
-        # centroid_m is kept for the EMA tracker (needs a stable 3-D anchor).
+        # Report distance/bearing to the NEAREST point of the cluster, not
+        # the centroid. When a cluster mixes obstacle surface pixels (near)
+        # with background pixels that bled through the depth map (far), the
+        # centroid is pulled toward the background, giving a wildly large
+        # reported distance. The nearest point is what a pedestrian would
+        # physically encounter.
         horiz_dists = np.sqrt(cluster_pts[:, 0] ** 2 + cluster_pts[:, 2] ** 2)
-        near_idx = int(np.argmin(horiz_dists))
-        X_near, _, Z_near = cluster_pts[near_idx]
-        distance_m = float(horiz_dists[near_idx])
+        nearest_point_idx = int(np.argmin(horiz_dists))
+        distance_m = float(horiz_dists[nearest_point_idx])
+        X_near, _, Z_near = cluster_pts[nearest_point_idx]
         bearing_deg = float(np.degrees(np.arctan2(X_near, Z_near)))
 
         u_min = int(cluster_pix[:, 0].min())

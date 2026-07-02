@@ -68,38 +68,40 @@ def extract_boundaries(
     binary = (mask != 0)  # bool (H, W) — works for uint8 and bool masks
     H = mask.shape[0]
 
-    # ---------- Connected-component isolation ----------
-    # WHY: The combined mask (class 0+1) labels both the brick sidewalk and
-    # the asphalt car road as traversable (class 0).  The boundary polynomial
-    # fitted over ALL traversable pixels extends into the road and parking lots.
-    #
-    # FIX: SegFormer labels the curb stone between sidewalk and road as a
-    # non-traversable class (wall / fence / building), creating a GAP in the
-    # combined mask.  That gap separates the sidewalk and car road into two
-    # distinct connected components.  We select the LARGEST component in the
-    # bottom 40 image rows — the region directly under the camera — which is
-    # always the sidewalk the person is standing on (wider at near distance
-    # than the adjacent road or parking lot across the curb gap).
-    #
-    # This is more robust than seeding at cx±100 px because cx may fall at the
-    # sidewalk–road boundary (when walking near one edge of the path), causing
-    # the seed to include road pixels.
+    # --- Connected-component isolation ---
+    # The mask can contain multiple disconnected regions (e.g., the sidewalk
+    # you are on, and another one across the street). We must isolate the
+    # component directly in front of the camera. We do this by finding the
+    # largest connected component in the bottom part of the image.
     if cx is not None:
         try:
-            from scipy import ndimage as _nd
-            struct = _nd.generate_binary_structure(2, 2)   # 8-connectivity
-            labeled, _ = _nd.label(binary, structure=struct)
-            # Count pixels per component label in the bottom 40 rows only.
-            bottom_slice = labeled[max(H - 40, 0):, :]
-            counts = np.bincount(bottom_slice.flatten())
-            counts[0] = 0   # exclude background (label 0)
-            seed_label = 0
-            if counts.max() > 0:
-                seed_label = int(counts.argmax())
-            if seed_label > 0:
-                binary = labeled == seed_label
-        except Exception:
-            pass  # fall back to full-mask if scipy unavailable
+            # Use OpenCV's connectedComponents which is already a dependency.
+            # This avoids adding a new scipy dependency.
+            import cv2
+            
+            num_labels, labeled, stats, centroids = cv2.connectedComponentsWithStats(
+                binary.astype(np.uint8), connectivity=8
+            )
+            
+            if num_labels > 1:
+                # Consider components in the bottom 40% of the image
+                bottom_half_start = int(H * 0.6)
+                
+                # Find the largest component that appears in the bottom half
+                candidate_labels = np.unique(labeled[bottom_half_start:])
+                if len(candidate_labels) > 1: # more than just background
+                    # Exclude background label 0
+                    candidate_labels = candidate_labels[candidate_labels != 0]
+                    
+                    # Get areas of these components
+                    areas = stats[candidate_labels, cv2.CC_STAT_AREA]
+                    
+                    # Select the largest one
+                    largest_label = candidate_labels[np.argmax(areas)]
+                    binary = (labeled == largest_label)
+
+        except ImportError:
+            pass # Fallback to using the full mask if cv2 is not available
 
     left_us: list[int] = []
     right_us: list[int] = []
@@ -121,21 +123,20 @@ def extract_boundaries(
     lu = np.array(left_us, dtype=np.float64)
     ru = np.array(right_us, dtype=np.float64)
 
-    # LEFT boundary: fit all valid rows.  The left edge (wall / vegetation) is
-    # reliable at all depths — it never bleeds into the road.
+    # LEFT boundary: fit all valid rows. The left edge (wall / vegetation) is
+    # usually reliable.
     left_poly = np.polyfit(vs, lu, poly_degree)
 
     # RIGHT boundary: fit only NEAR rows (bottom half of frame).
-    # Far rows (top of image) often include road pixels in the combined mask —
-    # the curb gap narrows at perspective distance and SegFormer's class-0
-    # ("road") label bleeds through, pulling the right boundary rightward.
-    # Fitting only near rows and extrapolating avoids this contamination.
-    near_row_cutoff = float(H) * 0.5   # rows at or below 50 % from top
+    # Far rows often include road pixels in the combined mask, pulling the
+    # right boundary rightward. Fitting only near rows and extrapolating
+    # avoids this contamination.
+    near_row_cutoff = float(H) * 0.5   # rows at or below 50% from top
     near_mask = vs >= near_row_cutoff
     if near_mask.sum() >= poly_degree + 1:
         right_poly = np.polyfit(vs[near_mask], ru[near_mask], poly_degree)
     else:
-        right_poly = np.polyfit(vs, ru, poly_degree)   # fallback
+        right_poly = np.polyfit(vs, ru, poly_degree)   # fallback if not enough near points
 
     return SidewalkBoundary(
         left_poly=left_poly,
@@ -190,6 +191,7 @@ def corridor_mask(
     margin: int = 20,
     max_width_px: np.ndarray | None = None,
     cx_px: float | None = None,
+    min_width_px: int = 10,
 ) -> np.ndarray:
     """Rasterize the walkable corridor into a full-resolution boolean mask.
 
@@ -233,7 +235,7 @@ def corridor_mask(
         right_raw = np.minimum(right_raw, cx_px + half)
     elif max_width_px is not None and len(max_width_px) == len(rows):
         right_raw = np.minimum(right_raw, left_raw + max_width_px)
-    right_raw = np.maximum(right_raw, left_raw)
+    right_raw = np.maximum(right_raw, left_raw + min_width_px)
 
     actual_width = np.maximum(0, right_raw - left_raw)
     if margin >= 0:
@@ -266,6 +268,7 @@ def draw_boundaries(
     fill_alpha: float = 0.25,
     max_width_px: np.ndarray | None = None,
     cx_px: float | None = None,
+    min_width_px: int = 10,
 ) -> np.ndarray:
     """Render the boundary curves and shaded corridor onto a copy of *frame*.
 
@@ -285,6 +288,7 @@ def draw_boundaries(
             resolution.  Used with max_width_px to centre the corridor on the
             camera pointing direction, preventing it from drifting into parking
             lots or grass that the segmentation mask incorrectly includes.
+        min_width_px: minimum corridor width in pixels to prevent collapse.
 
     Returns:
         Annotated frame copy (uint8 BGR HxWx3).
@@ -315,7 +319,7 @@ def draw_boundaries(
         right_raw = np.minimum(right_raw, cx_px + half)
     elif max_width_px is not None and len(max_width_px) == len(vs):
         right_raw = np.minimum(right_raw, left_raw + max_width_px)
-    right_raw = np.maximum(right_raw, left_raw)  # guarantee non-negative width
+    right_raw = np.maximum(right_raw, left_raw + min_width_px)  # guarantee minimum width
 
     actual_width = np.maximum(0, right_raw - left_raw)
     if margin >= 0:

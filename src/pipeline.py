@@ -131,23 +131,52 @@ class Pipeline:
         depth_scale = float(self._cfg.get("camera", {}).get("metric_scale_factor", 1.0))
         depth_m = depth_m * depth_scale
 
-        # Step 1 — back-project to 3-D using the full traversable mask (class 0+1).
-        # Keep ground_pixels for height-based boundary filtering in Step 3.
+        # Step 1 — back-project the FULL combined mask to 3-D.
+        # ground_pixels is reused in Step 3 to rebuild the boundary mask.
         points, ground_pixels = backproject(depth_m, runtime_intrinsics, mask=mask,
                                             _grid_cache=self._grid_cache)
-
+ 
         if len(points) < gp_cfg["ransac_min_inliers"]:
             return frame.copy(), []
-
-        # Step 2 — fit ground plane (RANSAC)
-        plane, _ = fit_ground_plane(
-            points,
-            distance_threshold=gp_cfg["ransac_distance_threshold"],
-            max_iterations=gp_cfg["ransac_max_iterations"],
-            min_inliers=gp_cfg["ransac_min_inliers"],
-            max_input_points=gp_cfg.get("ransac_max_input_points", 15000),
-        )
-
+ 
+        # Step 2 — fit ground plane (RANSAC) using NEAR-ROW points only.
+        #
+        # Problem: the combined mask contains brick sidewalk + asphalt road +
+        # (at far rows) a visible parallel sidewalk across the road.  When
+        # RANSAC subsamples all mask points, far-row road/parallel-sidewalk
+        # pixels can outnumber near-row brick pixels, causing RANSAC to fit the
+        # ROAD plane instead of the BRICK plane.  Then the height-above-plane
+        # values used in Step 3 are all non-negative (brick at +0.15 m, road at
+        # 0 m) and the road filter does nothing.
+        # Fix: pass ONLY the bottom 40 % of rows (near ground) to RANSAC. At
+        # these rows the camera is standing directly on the brick; road pixels
+        # at −15 cm are already 3× outside the 5 cm inlier threshold and are
+        # correctly treated as outliers. The parallel far sidewalk does not
+        # appear in near rows at all, so it cannot bias the fitted plane.
+        near_row_start = int(0.60 * H) # bottom 40 % of frame
+        near_row_mask_bool = ground_pixels[:, 1] >= near_row_start # v = row index
+        near_points = points[near_row_mask_bool] if len(points) > 0 else np.array([])
+ 
+        plane = None
+        if len(near_points) >= gp_cfg["ransac_min_inliers"]:
+            plane, _ = fit_ground_plane(
+                near_points,
+                distance_threshold=gp_cfg["ransac_distance_threshold"],
+                max_iterations=gp_cfg["ransac_max_iterations"],
+                min_inliers=gp_cfg["ransac_min_inliers"],
+                max_input_points=gp_cfg.get("ransac_max_input_points", 15000),
+            )
+        else:
+            # Fallback for sparse near rows
+            if len(points) >= gp_cfg["ransac_min_inliers"]:
+                plane, _ = fit_ground_plane(
+                    points,
+                    distance_threshold=gp_cfg["ransac_distance_threshold"],
+                    max_iterations=gp_cfg["ransac_max_iterations"],
+                    min_inliers=gp_cfg["ransac_min_inliers"],
+                    max_input_points=gp_cfg.get("ransac_max_input_points", 15000),
+                )
+ 
         # Step 3 — extract sidewalk boundaries using height-above-plane filtering.
         #
         # SegFormer labels both the brick sidewalk and the asphalt road as class-0
@@ -167,11 +196,23 @@ class Pipeline:
         # (first frame or too few inliers).
         if plane is not None and len(points) > 0:
             heights = point_height_above_plane(points, plane)
-            near_ground = heights > -0.10   # keep brick (≈0 cm), drop road (≈−15 cm)
+            near_ground = np.abs(heights) < 0.10   # keep points within +/- 10cm of the plane
             mask_for_boundary = np.zeros_like(mask)
             good_pix = ground_pixels[near_ground]  # (u=col, v=row) per backproject contract
-            if len(good_pix) > 0:
+            if len(good_pix) > 0: 
                 mask_for_boundary[good_pix[:, 1], good_pix[:, 0]] = 255
+
+            if frame_index is not None and frame_index % 30 == 0:
+                n_kept = int(near_ground.sum())
+                n_total = len(heights)
+                h_p10 = float(np.percentile(heights, 10))
+                h_p90 = float(np.percentile(heights, 90))
+                print(
+                    f"  [height diag frame {frame_index:05d}] "
+                    f"kept={n_kept}/{n_total} ({100*n_kept//max(1,n_total)} %)  "
+                    f"height p10={h_p10:.2f}m p90={h_p90:.2f}m  "
+                    f"(brick≈0 m, road≈−0.15 m)"
+                )
         else:
             mask_for_boundary = mask
 
@@ -281,6 +322,7 @@ class Pipeline:
                     margin=10,
                     max_width_px=max_width_px,
                     cx_px=cx_px,   # centre on camera direction, not mask edges
+                    min_width_px=int(cor_cfg.get("min_corridor_width_px", 10)),
                 )
             else:
                 search_mask = None
@@ -340,6 +382,7 @@ class Pipeline:
             max_display_obstacles=int(out_cfg.get("max_display_obstacles", 8)),
             max_width_px=max_width_px,
             cx_px=cx_px,
+            min_width_px=int(cor_cfg.get("min_corridor_width_px", 10)),
         )
 
         return annotated, active_tracks

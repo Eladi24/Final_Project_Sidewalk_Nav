@@ -45,7 +45,7 @@ obstacles:
                                     # and utility poles (~30 cm diameter) at 3-8 m while
                                     # still rejecting single-pixel noise fragments.
   max_candidate_points: 15000       # hard cap on points fed to DBSCAN per frame (lowered for 5x speedup)
-  max_obstacle_distance_m: 12.0     # discard obstacle clusters farther than this.
+  max_obstacle_distance_m: 15.0     # discard obstacle clusters farther than this.
                                     # With metric_scale_factor=0.3, physical distances
                                     # are now calibrated.  Beyond 12 m obstacles are not
                                     # actionable for a walking pedestrian and far clusters
@@ -54,28 +54,28 @@ obstacles:
 # Sidewalk corridor (src/segmentation/boundary.py)
 corridor:
   boundary_poly_degree: 2           # polynomial degree for left/right boundary fit
-  corridor_margin: 20               # pixel margin inset from the raw mask edge
-  min_boundary_coverage: 0.05       # min pixel fraction for sidewalk-only mask (class 1)
+  corridor_margin: 20               # pixel margin inset from the raw mask edge 
+  min_boundary_coverage: 0.10       # min pixel fraction for sidewalk-only mask (class 1)
                                     # to be used for boundary extraction instead of the
                                     # combined mask.  Israeli cobblestone sidewalks are
                                     # misclassified as class 0 (road), so class 1 coverage
                                     # is typically only 3–8%.  5% lets us use the class-1
                                     # boundary when it exists, while the left-anchor logic
                                     # in visual_boundary handles the remaining cases.
-  boundary_ema_alpha: 0.2           # temporal EMA weight for new boundary observation.
-                                    # 0.2 ≈ 5-frame effective window.  Raised from 0.1
-                                    # so the corridor adapts faster to sidewalk curves
-                                    # while still suppressing single-frame jitter.
-  max_boundary_jump_px: 60          # if left OR right boundary shifts more than this many
+  boundary_ema_alpha: 0.4           # temporal EMA weight for new boundary observation.
+                                    # 0.4 ≈ 2-3 frame effective window. Increased from 0.2
+                                    # to make the path more responsive to turns and prevent
+                                    # it from getting "stuck" on stale data.
+  max_boundary_jump_px: 100         # if left OR right boundary shifts more than this many
                                     # pixels at the frame mid-row relative to the previous
                                     # frame, treat this frame's boundary as unreliable.
-                                    # Raised from 40 so legitimate curve transitions on
-                                    # a winding sidewalk are not rejected as transients.
-  max_corridor_width_m: 3.0         # physical cap on corridor width in metres.
+                                    # Raised from 60 to be more tolerant of legitimate,
+                                    # large path changes when turning.
+  max_corridor_width_m: 2.5         # physical cap on corridor width in metres.
                                     # Applied at render and search time via max_width_px
                                     # = max_corridor_width_m × fx / max(Z_row, z_floor_m).
                                     # Israeli sidewalks range from 1.5 m (narrow) to 4 m
-                                    # (wide boulevard).  3.0 m covers most while keeping
+                                    # (wide boulevard).  2.5 m covers most while keeping
                                     # the corridor off a typical 6 m road lane.
   z_floor_m: 5.0                    # minimum ground-plane depth (metres) used when
                                     # computing max_width_px per row.  Without this floor,
@@ -83,6 +83,7 @@ corridor:
                                     # 2.5 × fx / 1.5 ≈ 1300 px > image width = inactive.
                                     # With z_floor = 5 m: max_width_px ≤ 2.5×780/5 = 390 px
                                     # at all rows → corridor bounded to ≤ 2.5 m always.
+  min_corridor_width_px: 10         # minimum corridor width in pixels to prevent path collapse.
 
 # Temporal tracking (src/obstacles/tracker.py)
 tracking:
